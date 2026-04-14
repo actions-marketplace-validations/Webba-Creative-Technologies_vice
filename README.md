@@ -185,7 +185,7 @@ Give VICE a URL and it audits your site from the outside using a headless browse
 | **Login Audit** | GET vs POST form, CSRF tokens, brute force (5 attempts), user enumeration, SQL injection (5 phases with UNION extraction), password reset security, external script injection demo |
 | **Stack Detection** | 40+ technologies fingerprinted across frameworks, servers, BaaS, analytics, build tools, UI libraries |
 | **Subdomain Scan** | DNS enumeration of 80+ common subdomains, HTTP/HTTPS check, dangerous subdomain detection |
-| **DNS & Email** | SPF, DKIM (12 selectors), DMARC policy analysis, dangling CNAME detection (subdomain takeover) |
+| **DNS & Email** | SPF, DKIM (14 selectors), DMARC policy analysis, dangling CNAME detection (subdomain takeover) |
 | **API Endpoints** | Discovery from JS bundles, auth testing, rate limiting, SQL injection, CORS per endpoint |
 | **Storage Buckets** | Supabase Storage bucket enumeration, file listing, upload testing, S3/GCS URL detection |
 | **WebSocket** | Realtime channel eavesdropping, Supabase Realtime, Socket.IO, unauthenticated message capture |
