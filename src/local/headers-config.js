@@ -1,5 +1,5 @@
 // ──────────────────────────────────────────────
-// VICE LOCAL — Security Headers Config Audit
+// VICE LOCAL - Security Headers Config Audit
 // Webba Creative Technologies (c) 2026
 // ──────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ export async function auditHeadersConfig(projectPath, spinner) {
     'app.js': 'express', 'app.ts': 'express',
   };
 
-  let cspFound = false, hstsFound = false;
+  let cspFound = false, hstsFound = false, headerLayerFound = false;
 
   for (const [filename, framework] of Object.entries(configFiles)) {
     const searchPaths = [
@@ -29,23 +29,18 @@ export async function auditHeadersConfig(projectPath, spinner) {
     ];
 
     for (const filePath of searchPaths) {
-      if (!fs.existsSync(filePath)) continue;
-      const content = fs.readFileSync(filePath, 'utf-8');
+      let content;
+      try { content = await fs.promises.readFile(filePath, 'utf-8'); } catch { continue; }
       const rel = path.relative(projectPath, filePath);
 
       if (/Content-Security-Policy|contentSecurityPolicy|csp/i.test(content)) cspFound = true;
       if (/Strict-Transport-Security|hsts/i.test(content)) hstsFound = true;
+      if (framework === 'nginx' || framework === 'netlify' || /(?:headers\s*[:(]|setHeader\s*\(|helmet\s*\()/i.test(content)) {
+        headerLayerFound = true;
+      }
 
       if (/next\.config/i.test(filename) && !/poweredByHeader\s*:\s*false/i.test(content)) {
-        addFinding('MEDIUM', 'Headers Config', `X-Powered-By not disabled in ${rel}`, 'Next.js exposes X-Powered-By header by default', 'Add to next.config.js:\n  poweredByHeader: false');
-      }
-
-      if (/nuxt\.config/i.test(filename) && !cspFound) {
-        addFinding('HIGH', 'Headers Config', `No CSP configured in ${rel}`, 'Nuxt does not add Content-Security-Policy by default', 'Add to nuxt.config:\n  routeRules: { \'/**\': { headers: { \'Content-Security-Policy\': "default-src \'self\'" } } }');
-      }
-
-      if (filename === 'vercel.json' && !/headers/i.test(content)) {
-        addFinding('MEDIUM', 'Headers Config', 'No security headers in vercel.json', '', 'Add a headers section in vercel.json');
+        addFinding('INFO', 'Headers Config', `Next.js framework header is enabled in ${rel}`, 'The default X-Powered-By header reveals the framework.', 'Set poweredByHeader: false if this disclosure is not useful.', { file: rel }, 'high', { rule_id: 'vice/headers/framework-disclosure', classification: 'hardening' });
       }
     }
   }
@@ -53,8 +48,9 @@ export async function auditHeadersConfig(projectPath, spinner) {
   // .htaccess files (Apache)
   const htaccessPaths = ['', 'public', 'dist'].map(d => path.join(projectPath, d, '.htaccess'));
   for (const filePath of htaccessPaths) {
-    if (!fs.existsSync(filePath)) continue;
-    const content = fs.readFileSync(filePath, 'utf-8');
+    let content;
+    try { content = await fs.promises.readFile(filePath, 'utf-8'); } catch { continue; }
+    headerLayerFound = true;
     if (/Header\s+(set|always\s+set)\s+Content-Security-Policy/i.test(content)) cspFound = true;
     if (/Header\s+(set|always\s+set)\s+Strict-Transport-Security/i.test(content)) hstsFound = true;
   }
@@ -62,12 +58,16 @@ export async function auditHeadersConfig(projectPath, spinner) {
   // <meta http-equiv> in HTML files
   const htmlPaths = ['', 'public', 'dist', 'src'].map(d => path.join(projectPath, d, 'index.html'));
   for (const filePath of htmlPaths) {
-    if (!fs.existsSync(filePath)) continue;
-    const content = fs.readFileSync(filePath, 'utf-8');
+    let content;
+    try { content = await fs.promises.readFile(filePath, 'utf-8'); } catch { continue; }
     if (/<meta\s+http-equiv\s*=\s*["']Content-Security-Policy["']/i.test(content)) cspFound = true;
     if (/<meta\s+http-equiv\s*=\s*["']Strict-Transport-Security["']/i.test(content)) hstsFound = true;
   }
 
-  if (!cspFound) addFinding('HIGH', 'Headers Config', 'No CSP configuration found in project', 'Content-Security-Policy is not configured anywhere', 'Add CSP in your server or framework configuration');
-  if (!hstsFound) addFinding('HIGH', 'Headers Config', 'No HSTS configuration found in project', 'Strict-Transport-Security is not configured anywhere', 'Add HSTS in your server configuration');
+  if (headerLayerFound && !cspFound) {
+    addFinding('INFO', 'Headers Config', 'CSP not found in the inspected header layer', 'A server or deployment header configuration was found, but it does not define Content-Security-Policy.', 'Consider adding CSP after validating the application resource policy.', undefined, 'high', { rule_id: 'vice/headers/local-csp-hardening', classification: 'hardening' });
+  }
+  if (headerLayerFound && !hstsFound) {
+    addFinding('INFO', 'Headers Config', 'HSTS not found in the inspected header layer', 'A server or deployment header configuration was found, but it does not define Strict-Transport-Security.', 'If HTTPS is enforced at this layer, consider adding HSTS.', undefined, 'high', { rule_id: 'vice/headers/local-hsts-hardening', classification: 'hardening' });
+  }
 }

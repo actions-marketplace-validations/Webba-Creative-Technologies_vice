@@ -1,11 +1,21 @@
 node_modules/
 scans/
 .env*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.*.sample
 .vice-accepted
 *.log
 *.tgz
-MARKETING.md
 .DS_Store
 Thumbs.db
-.claude/
 .webba/
+
+# Chromium / Puppeteer crash-reporting data
+/Crashpad/
+/CrashpadMetrics*.pma
+
+# Local notes
+/BLACKBOX.md
+/.blackbox/

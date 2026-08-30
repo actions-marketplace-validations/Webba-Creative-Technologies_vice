@@ -1,0 +1,207 @@
+// ──────────────────────────────────────────────
+// VICE LOCAL - Container & IaC Audit
+// Reviews Dockerfile and docker-compose for common misconfigurations:
+// running as root, secrets baked into images, untagged base images,
+// services exposed on 0.0.0.0, and privileged containers.
+// Webba Creative Technologies (c) 2026
+// ──────────────────────────────────────────────
+
+import fs from 'fs';
+import path from 'path';
+import { addFinding } from '../core/findings.js';
+import { isLikelyGenericSecret, isPlaceholderSecret } from '../utils/patterns.js';
+
+function getLine(content, position) {
+  return content.substring(0, position).split('\n').length;
+}
+
+function auditDockerfile(content, rel) {
+  let issues = 0;
+
+  // FROM with :latest or no tag
+  const fromRegex = /^FROM\s+(--platform=\S+\s+)?(\S+)(\s+AS\s+\S+)?\s*$/gim;
+  let m;
+  while ((m = fromRegex.exec(content)) !== null) {
+    const image = m[2];
+    if (image.startsWith('scratch')) continue;
+    const tag = image.split(':')[1];
+    const line = getLine(content, m.index);
+    if (!tag) {
+      addFinding('INFO', 'Container', `FROM without explicit tag in ${rel}:${line}`,
+        `${m[0].trim()}\nNo tag specified - defaults to :latest, making builds non-reproducible.`,
+        `Pin to a specific version: FROM ${image}:1.2.3 or use a digest.`,
+        { file: rel, line }, 'high');
+      issues++;
+    } else if (tag === 'latest') {
+      addFinding('INFO', 'Container', `FROM uses :latest in ${rel}:${line}`,
+        `${m[0].trim()}\nLatest tag changes silently and breaks reproducibility.`,
+        `Pin to a specific version: FROM ${image.split(':')[0]}:1.2.3`,
+        { file: rel, line }, 'high');
+      issues++;
+    }
+  }
+
+  // No USER directive (or runs as root)
+  const userMatches = [...content.matchAll(/^USER\s+(\S+)/gim)];
+  if (userMatches.length > 0) {
+    const lastUser = userMatches[userMatches.length - 1];
+    const userVal = lastUser[1].trim();
+    if (userVal === '0' || userVal === 'root') {
+      const line = getLine(content, lastUser.index);
+      addFinding('MEDIUM', 'Container', `USER root explicitly set in ${rel}:${line}`,
+        `Container runs as root.`,
+        `Use a non-root user: USER appuser (after creating it via RUN adduser).`,
+        { file: rel, line }, 'high');
+      issues++;
+    }
+  }
+
+  // ADD with URL (no checksum verification possible)
+  const addUrlRegex = /^ADD\s+(?:--\S+\s+)*https?:\/\/\S+/gim;
+  while ((m = addUrlRegex.exec(content)) !== null) {
+    const line = getLine(content, m.index);
+    addFinding('MEDIUM', 'Container', `ADD with URL in ${rel}:${line}`,
+      `${m[0]}\nADD does not verify checksums. A compromised origin would push malicious content into your image.`,
+      `Replace with: RUN curl -fsSL <url> -o file && echo "<sha256>  file" | sha256sum -c`,
+      { file: rel, line }, 'medium');
+    issues++;
+  }
+
+  // Hardcoded secrets in ENV
+  const envSecretRegex = /^ENV\s+(\w*(?:SECRET|PASSWORD|API[_-]?KEY|TOKEN|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)\w*)[\s=]+\S+/gim;
+  while ((m = envSecretRegex.exec(content)) !== null) {
+    const line = getLine(content, m.index);
+    if (isPlaceholderSecret(m[0]) || !isLikelyGenericSecret(m[0])) continue;
+    addFinding('CRITICAL', 'Container', `Potential secret in ENV in ${rel}:${line}`,
+      `ENV ${m[1]}=<redacted>\nSecrets baked into image layers are accessible to anyone with the image. They cannot be revoked from existing pulls.`,
+      `Pass secrets at runtime instead: docker run -e SECRET=val (or use Docker/Compose secrets).`,
+      { file: rel, line }, 'high');
+    issues++;
+  }
+
+  return issues;
+}
+
+function auditCompose(content, rel) {
+  let issues = 0;
+  let m;
+
+  // privileged: true
+  const privRegex = /^[ \t]+privileged:\s*true/gim;
+  while ((m = privRegex.exec(content)) !== null) {
+    const line = getLine(content, m.index);
+    addFinding('HIGH', 'Container', `privileged: true in ${rel}:${line}`,
+      `Container has full host access. Effectively root on the Docker host.`,
+      `Remove privileged: true. If specific capabilities are needed, use cap_add.`,
+      { file: rel, line }, 'high');
+    issues++;
+  }
+
+  const dockerSocketRegex = /^[^#\n]*\/var\/run\/docker\.sock(?:\s*:\s*\/var\/run\/docker\.sock)?[^\n]*$/gim;
+  while ((m = dockerSocketRegex.exec(content)) !== null) {
+    const line = getLine(content, m.index);
+    addFinding('CRITICAL', 'Container', `Docker socket mounted in ${rel}:${line}`,
+      'The container can control the Docker daemon and normally obtain root-level access to the host.',
+      'Remove the socket mount. Use a restricted proxy exposing only the required Docker API operations.',
+      { file: rel, line }, 'high');
+    issues++;
+  }
+
+  const hostNamespaceChecks = [
+    { regex: /^[ \t]+network_mode:\s*["']?host["']?\s*(?:#.*)?$/gim, label: 'host network namespace' },
+    { regex: /^[ \t]+pid:\s*["']?host["']?\s*(?:#.*)?$/gim, label: 'host PID namespace' },
+    { regex: /^[ \t]+ipc:\s*["']?host["']?\s*(?:#.*)?$/gim, label: 'host IPC namespace' },
+  ];
+  for (const check of hostNamespaceChecks) {
+    while ((m = check.regex.exec(content)) !== null) {
+      const line = getLine(content, m.index);
+      addFinding('HIGH', 'Container', `${check.label} enabled in ${rel}:${line}`,
+        `The service shares the ${check.label.replace('host ', '')} with the host, weakening container isolation.`,
+        'Use the default isolated namespace and expose only explicitly required resources.',
+        { file: rel, line }, 'high');
+      issues++;
+    }
+  }
+
+  const allCapabilitiesRegex = /^[ \t]+cap_add:\s*(?:\[[^\]\n]*\bALL\b[^\]\n]*\]|\r?\n[ \t]+-\s*["']?ALL["']?\s*(?:#.*)?$)/gim;
+  while ((m = allCapabilitiesRegex.exec(content)) !== null) {
+    const line = getLine(content, m.index);
+    addFinding('HIGH', 'Container', `All Linux capabilities added in ${rel}:${line}`,
+      'cap_add: ALL removes most capability-based isolation from the container.',
+      'Remove cap_add: ALL and grant only the individual capability that is strictly required.',
+      { file: rel, line }, 'high');
+    issues++;
+  }
+
+  const unconfinedRegex = /^(?![ \t]*#)[^\n]*(?:seccomp|apparmor)\s*[:=]\s*unconfined[^\n]*$/gim;
+  while ((m = unconfinedRegex.exec(content)) !== null) {
+    const line = getLine(content, m.index);
+    addFinding('HIGH', 'Container', `Unconfined security profile in ${rel}:${line}`,
+      `${m[0].trim()} disables a kernel-level container confinement profile.`,
+      'Remove the unconfined option or provide a minimal custom seccomp or AppArmor profile.',
+      { file: rel, line }, 'high');
+    issues++;
+  }
+
+  // Explicit 0.0.0.0 and HOST:CONTAINER short syntax both bind publicly.
+  // Localhost bindings do not match this expression.
+  const portRegex = /^[ \t]*-\s*["']?(?:0\.0\.0\.0:)?(\d+):(\d+)(?:\/(?:tcp|udp))?["']?\s*(?:#.*)?$/gm;
+  while ((m = portRegex.exec(content)) !== null) {
+    const port = parseInt(m[1]);
+    const containerPort = parseInt(m[2]);
+    const line = getLine(content, m.index);
+    const dbPorts = [3306, 5432, 27017, 6379, 9200, 11211, 5984];
+    const isDatabase = dbPorts.includes(port) || dbPorts.includes(containerPort);
+    if (isDatabase) {
+      addFinding('HIGH', 'Container', `Database service exposed on 0.0.0.0:${port} in ${rel}:${line}`,
+        `Host port ${port} publishes database port ${containerPort} on every network interface.`,
+        `Bind to localhost: "127.0.0.1:${port}:${containerPort}" or keep the service on the internal Compose network.`,
+        { file: rel, line }, 'high');
+      issues++;
+    }
+  }
+
+  // Hardcoded secrets in environment:
+  const envSecretRegex = /^[ \t]+(?:-\s+)?(\w*(?:SECRET|PASSWORD|API[_-]?KEY|TOKEN|PRIVATE[_-]?KEY|ACCESS[_-]?KEY)\w*)\s*[:=]\s*["']?([^"'\n${}]+)["']?/gim;
+  while ((m = envSecretRegex.exec(content)) !== null) {
+    const value = m[2].trim();
+    if (!value || isPlaceholderSecret(`${m[1]}=${value}`) || !isLikelyGenericSecret(value)) continue;
+    const line = getLine(content, m.index);
+    addFinding('CRITICAL', 'Container', `Potential secret in environment in ${rel}:${line}`,
+      `${m[1]}=<redacted>\nCommitted secrets in compose files are visible to anyone with repo access and history.`,
+      `Use a .env file (in .gitignore) referenced via env_file: or use Docker secrets.`,
+      { file: rel, line }, 'high');
+    issues++;
+  }
+
+  return issues;
+}
+
+export async function auditContainer(projectPath, spinner) {
+  spinner.text = 'Auditing container configuration...';
+
+  let issues = 0;
+  let scanned = 0;
+
+  const dockerfilePath = path.join(projectPath, 'Dockerfile');
+  let dockerfileContent;
+  try { dockerfileContent = await fs.promises.readFile(dockerfilePath, 'utf-8'); } catch {}
+  if (dockerfileContent) {
+    scanned++;
+    issues += auditDockerfile(dockerfileContent, 'Dockerfile');
+  }
+
+  for (const name of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+    const composePath = path.join(projectPath, name);
+    let content;
+    try { content = await fs.promises.readFile(composePath, 'utf-8'); } catch { continue; }
+    scanned++;
+    issues += auditCompose(content, name);
+  }
+
+  if (scanned === 0) {
+    addFinding('INFO', 'Container', 'No Dockerfile or docker-compose found', '', '');
+  } else if (issues === 0) {
+    addFinding('INFO', 'Container', `${scanned} container file(s) scanned, no issues`, '', '');
+  }
+}

@@ -1,10 +1,11 @@
 // ──────────────────────────────────────────────
-// VICE — Score Calculator
+// VICE - Score Calculator
 // Webba Creative Technologies (c) 2026
 // ──────────────────────────────────────────────
 
 import chalk from 'chalk';
 import { getFindings } from './findings.js';
+import { groupKey } from './fingerprint.js';
 
 // Supports both French (legacy scan.js) and English severity levels
 const WEIGHT_MAP = {
@@ -15,12 +16,64 @@ const WEIGHT_MAP = {
   INFO: 0,
 };
 
-export function calculateScore(findingsData) {
+// Cap how many times the same rule can hit the score (prevents one noisy
+// rule on many files from tanking the grade beyond reason).
+const MAX_PENALTIES_PER_RULE = 3;
+
+const CONFIDENCE_RANK = { high: 3, medium: 2, low: 1 };
+export const SEVERITY_RANK = {
+  CRITICAL: 5, CRITIQUE: 5,
+  HIGH: 4, ELEVEE: 4,
+  MEDIUM: 3, MOYENNE: 3,
+  LOW: 2, FAIBLE: 2,
+  INFO: 1,
+};
+
+export function calculateScore(findingsData, options = {}) {
   const data = findingsData || getFindings();
-  let penalty = 0;
+  const minConfidence = options.minConfidence || 'low';
+  const minRank = CONFIDENCE_RANK[minConfidence] || 1;
+  const minSevRank = options.minSeverity ? (SEVERITY_RANK[options.minSeverity.toUpperCase()] || 1) : 1;
+
+  const penaltiesByRule = new Map();
+  const excluded = { baselined: 0, confidence: 0, severity: 0, informational: 0 };
+
   for (const f of data) {
-    penalty += WEIGHT_MAP[f.severity] || 0;
+    if (f.baselined) {
+      excluded.baselined++;
+      continue;
+    }
+    const rank = CONFIDENCE_RANK[f.confidence || 'medium'] || 2;
+    if (rank < minRank) {
+      excluded.confidence++;
+      continue;
+    }
+    if ((SEVERITY_RANK[f.severity] || 0) < minSevRank) {
+      excluded.severity++;
+      continue;
+    }
+    const weight = WEIGHT_MAP[f.severity] || 0;
+    if (weight === 0) {
+      excluded.informational++;
+      continue;
+    }
+    const key = groupKey(f);
+    const weights = penaltiesByRule.get(key) || [];
+    weights.push(weight);
+    penaltiesByRule.set(key, weights);
   }
+
+  const breakdown = [...penaltiesByRule.entries()].map(([ruleId, weights]) => {
+    const strongest = [...weights].sort((left, right) => right - left).slice(0, MAX_PENALTIES_PER_RULE);
+    return {
+      rule_id: ruleId,
+      penalty: strongest.reduce((sum, weight) => sum + weight, 0),
+      counted_findings: strongest.length,
+      observed_findings: weights.length,
+    };
+  }).sort((left, right) => right.penalty - left.penalty || left.rule_id.localeCompare(right.rule_id));
+  const penalty = breakdown.reduce((total, rule) => total + rule.penalty, 0);
+
   const rawScore = Math.max(0, 100 - penalty);
   let grade, color;
   if (rawScore >= 90) { grade = 'A'; color = chalk.green.bold; }
@@ -29,7 +82,15 @@ export function calculateScore(findingsData) {
   else if (rawScore >= 40) { grade = 'D'; color = chalk.red.bold; }
   else if (rawScore >= 20) { grade = 'E'; color = chalk.bgRed.white.bold; }
   else { grade = 'F'; color = chalk.bgRed.white.bold; }
-  return { score: rawScore, grade, color };
+  return {
+    score: rawScore,
+    grade,
+    color,
+    total_penalty: penalty,
+    breakdown,
+    excluded,
+    min_confidence: minConfidence,
+  };
 }
 
 const SEV_COLOR_MAP = {
