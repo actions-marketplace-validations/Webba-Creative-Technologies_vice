@@ -3007,7 +3007,7 @@ async function auditDns(baseUrl, spinner) {
 
   // ── DKIM ──
   spinner.text = 'Checking DKIM...';
-  const dkimSelectors = ['default', 'google', 'dkim', 'mail', 'k1', 'selector1', 'selector2', 's1', 's2', 'mandrill', 'everlytickey1', 'mxvault'];
+  const dkimSelectors = ['default', 'google', 'dkim', 'mail', 'k1', 'ovhmo-selector-1', 'ovhmo-selector-2', 'selector1', 'selector2', 's1', 's2', 'mandrill', 'everlytickey1', 'mxvault'];
   let dkimFound = false;
 
   for (const selector of dkimSelectors) {
