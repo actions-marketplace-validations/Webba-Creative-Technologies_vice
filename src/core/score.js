@@ -1,11 +1,12 @@
-// ──────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // VICE - Score Calculator
 // Webba Creative Technologies (c) 2026
-// ──────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 import chalk from 'chalk';
 import { getFindings } from './findings.js';
 import { groupKey } from './fingerprint.js';
+import { scorePresentation } from './score-policy.js';
 
 // Supports both French (legacy scan.js) and English severity levels
 const WEIGHT_MAP = {
@@ -36,6 +37,7 @@ export function calculateScore(findingsData, options = {}) {
   const minSevRank = options.minSeverity ? (SEVERITY_RANK[options.minSeverity.toUpperCase()] || 1) : 1;
 
   const penaltiesByRule = new Map();
+  let impactCeiling = 100;
   const excluded = { baselined: 0, confidence: 0, severity: 0, informational: 0 };
 
   for (const f of data) {
@@ -57,9 +59,14 @@ export function calculateScore(findingsData, options = {}) {
       excluded.informational++;
       continue;
     }
-    const key = groupKey(f);
+    if (f.classification === 'confirmed' && rank >= 2) {
+      if (['CRITIQUE', 'CRITICAL'].includes(f.severity)) impactCeiling = Math.min(impactCeiling, 39);
+      else if (['ELEVEE', 'HIGH'].includes(f.severity)) impactCeiling = Math.min(impactCeiling, 69);
+    }
+    const key = f.cause_key || groupKey(f);
     const weights = penaltiesByRule.get(key) || [];
-    weights.push(weight);
+    if (f.cause_key) weights[0] = Math.max(weights[0] || 0, weight);
+    else weights.push(weight);
     penaltiesByRule.set(key, weights);
   }
 
@@ -74,22 +81,30 @@ export function calculateScore(findingsData, options = {}) {
   }).sort((left, right) => right.penalty - left.penalty || left.rule_id.localeCompare(right.rule_id));
   const penalty = breakdown.reduce((total, rule) => total + rule.penalty, 0);
 
-  const rawScore = Math.max(0, 100 - penalty);
-  let grade, color;
-  if (rawScore >= 90) { grade = 'A'; color = chalk.green.bold; }
-  else if (rawScore >= 75) { grade = 'B'; color = chalk.hex('#995ff6').bold; }
-  else if (rawScore >= 60) { grade = 'C'; color = chalk.yellow.bold; }
-  else if (rawScore >= 40) { grade = 'D'; color = chalk.red.bold; }
-  else if (rawScore >= 20) { grade = 'E'; color = chalk.bgRed.white.bold; }
-  else { grade = 'F'; color = chalk.bgRed.white.bold; }
+  const coverageCeiling = options.coverageStatus === 'incomplete' ? 49
+    : options.coverageStatus === 'partial' ? 89 : 100;
+  const rawScore = Math.max(0, Math.min(100 - penalty, impactCeiling, coverageCeiling));
+  const presentation = scorePresentation(rawScore, {
+    criticalCount: data.filter(f => !f.baselined && ['CRITICAL', 'CRITIQUE'].includes(f.severity)).length,
+    highCount: data.filter(f => !f.baselined && ['HIGH', 'ELEVEE'].includes(f.severity)).length,
+    reliable: options.reliable,
+    coverageStatus: options.coverageStatus,
+    authStatus: options.authStatus,
+  });
+  const grade = presentation.grade;
+  const color = presentation.tone === 'error' ? chalk.red.bold
+    : presentation.tone === 'success' ? chalk.green.bold : chalk.yellow.bold;
   return {
     score: rawScore,
     grade,
     color,
+    presentation,
     total_penalty: penalty,
     breakdown,
     excluded,
     min_confidence: minConfidence,
+    impact_ceiling: impactCeiling,
+    coverage_ceiling: coverageCeiling,
   };
 }
 

